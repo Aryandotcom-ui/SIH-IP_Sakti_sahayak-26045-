@@ -1,0 +1,1302 @@
+from __future__ import annotations
+
+from dataclasses import asdict, replace
+import logging
+from pathlib import Path
+import sys
+import threading
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+# The AI folder is a sibling of backend/, so add the repository root.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from ai.embedder import Embedder, get_embedder  # noqa: E402
+from ai.person_b_retrieval.confidence import compute_confidence, evidence_strength  # noqa: E402
+from ai.person_b_retrieval.domain_gate import (  # noqa: E402
+    DomainDecision,
+    QueryDomain,
+    classify_domain,
+)
+from ai.person_b_retrieval.schema import (  # noqa: E402
+    Classification,
+    MatchedChunk,
+    RetrievalResult,
+)
+from ai.store import VectorStore  # noqa: E402
+from ai.person_c_generation.generate import generate_answer  # noqa: E402
+from ai.compliance import get_assessor  # noqa: E402
+from ai.audit import AuditLog  # noqa: E402
+from ai.translation import (  # noqa: E402
+    Translator,
+    detect_language,
+    get_translator,
+    translate_answer_from_english,
+    translate_query_to_english,
+    translation_status,
+    translator_configured,
+)
+
+from ..config import settings  # noqa: E402
+from ..schemas import SCOPE_JURISDICTION, SCOPE_LABEL  # noqa: E402
+
+
+def _scope_jurisdiction(scope: str) -> str:
+    """The jurisdiction name matching a resolved scope.
+
+    "BOTH" becomes "both" rather than being left absent or guessed at one
+    side: an answer drawn from two legal systems has a jurisdiction, and
+    it is not either of them alone. Kept as a function beside
+    SCOPE_JURISDICTION (which only maps the two single scopes) so the
+    three-valued form has one definition instead of being re-derived at
+    each response site.
+    """
+    return SCOPE_JURISDICTION.get(scope, "both")
+
+
+class AIService:
+    """Application-facing adapter around the existing AI pipeline.
+
+    The backend does not duplicate the team's RAG/generation logic. It
+    converts HTTP input into the agreed AI shapes and returns a JSON-safe
+    response for the frontend.
+    """
+
+    def __init__(self) -> None:
+        self._embedder: Embedder | None = None
+        self._store: VectorStore | None = None
+        self._audit: AuditLog | None = None
+        self._translator: Translator | None = None
+        # FastAPI runs sync endpoints in a threadpool, so two requests that
+        # arrive before the first one has finished building these run the
+        # lazy initialisation concurrently. Chroma in particular does not
+        # survive that: two PersistentClients opening the same directory at
+        # once fail with whichever of several unrelated-looking errors the
+        # race happens to produce ("Could not connect to tenant
+        # default_tenant", "'RustBindingsAPI' object has no attribute
+        # 'bindings'", a bare KeyError on the path). The symptom is that the
+        # first couple of visitors after a cold start get a 503 and everyone
+        # after them is fine, which reads as a flaky backend rather than as
+        # a race. One lock per resource, double-checked, removes it.
+        self._locks = {name: threading.Lock() for name in
+                       ("embedder", "store", "audit", "translator")}
+
+    @property
+    def embedder(self) -> Embedder:
+        """The embedder must be the one the index was built with.
+
+        If a fitted TF-IDF vectorizer is sitting beside the Chroma index,
+        that is definitive: the index was built from that vector space and
+        encoding queries with anything else puts them in a different one,
+        which degrades retrieval to noise without raising. So the artifact
+        wins over the configured model name rather than the other way
+        round.
+        """
+        if self._embedder is None:
+            with self._locks["embedder"]:
+                if self._embedder is None:
+                    from ai.embedder import TfidfEmbedder
+                    artifact = Path(settings.chroma_path) / TfidfEmbedder.ARTIFACT_NAME
+                    if artifact.is_file():
+                        logging.getLogger(__name__).info(
+                            "loading TF-IDF vectorizer saved with the index (%s)", artifact
+                        )
+                        self._embedder = TfidfEmbedder.load(settings.chroma_path)
+                    else:
+                        self._embedder = get_embedder(
+                            settings.embedding_model,
+                            device=settings.embedding_device,
+                        )
+        return self._embedder
+
+    @property
+    def store(self) -> VectorStore:
+        if self._store is None:
+            with self._locks["store"]:
+                if self._store is None:
+                    self._store = VectorStore(
+                        settings.chroma_path,
+                        collection=settings.chroma_collection,
+                    )
+        return self._store
+
+    @property
+    def audit(self) -> AuditLog:
+        if self._audit is None:
+            with self._locks["audit"]:
+                if self._audit is None:
+                    self._audit = AuditLog(
+                        settings.audit_db_path,
+                        corpus_path=settings.corpus_manifest_path,
+                    )
+        return self._audit
+
+    @property
+    def translator(self) -> Translator:
+        if self._translator is None:
+            with self._locks["translator"]:
+                if self._translator is None:
+                    self._translator = get_translator(
+                        settings.bhashini_api_key, settings.bhashini_user_id
+                    )
+        return self._translator
+
+    @property
+    def confidence_calibrated(self) -> bool:
+        """Whether the active embedder's similarity supports a confidence
+        that means anything.
+
+        The offline TF-IDF stand-in ranks on shared character n-grams: good
+        enough to order chunks, useless for deciding whether the best one is
+        on topic (see TfidfEmbedder.CALIBRATED). A percentage derived from it
+        looks exactly like a calibrated one in the UI, and the abstention
+        built on it does not fire — so the response carries this and the UI
+        says so, on the same principle that makes `generation` report "mock".
+        An embedder that does not declare itself is assumed calibrated: the
+        real backend is the shipping default, and this flag exists to mark
+        the exception rather than to make every backend opt in.
+        """
+        return bool(getattr(type(self.embedder), "CALIBRATED", True))
+
+    def reset_index_cache(self) -> None:
+        """Drop the cached embedder and store.
+
+        Both are resolved lazily and then held for the process lifetime,
+        and the embedder in particular is chosen by which artifact sits
+        beside the index. Anything resolved before the index was built was
+        resolved against an absent artifact, so after a build the cached
+        pair is stale and would keep querying the empty collection.
+        """
+        with self._locks["embedder"]:
+            self._embedder = None
+        with self._locks["store"]:
+            self._store = None
+
+    def corpus_count(self) -> int:
+        return self.store.count()
+
+    def corpus_jurisdictions(self) -> dict[str, int]:
+        """Chunk counts per jurisdiction — how much corpus each scope of the
+        jurisdiction toggle actually has behind it.
+
+        The UI shows these on the toggle, so a scope with nothing ingested
+        reads as empty rather than as broken. Degrades to {} rather than
+        raising: a count that could not be taken must not take down the
+        corpus-status endpoint that the rest of the app polls for liveness.
+
+        Deliberately uncached, and measured rather than assumed: this runs
+        on every answer() call and costs ~10ms against a 2,274-chunk index,
+        against a ~2,200ms full request — 0.5%. Caching it would buy
+        nothing measurable and would introduce a staleness bug, since a
+        re-ingest changes these counts while the process keeps running and
+        a cached toggle would then advertise a corpus size that no longer
+        exists. If the corpus grows by an order of magnitude, re-measure
+        before assuming that still holds.
+        """
+        counts: dict[str, int] = {}
+        for scope, jurisdiction in SCOPE_JURISDICTION.items():
+            try:
+                got = self.store.collection.get(
+                    where={"jurisdiction": jurisdiction}, include=[]
+                )
+                counts[jurisdiction] = len(got.get("ids") or [])
+            except Exception:  # pragma: no cover - defensive
+                logging.getLogger(__name__).exception(
+                    "could not count %s chunks", jurisdiction
+                )
+        return counts
+
+    def corpus_jurisdiction_values(self, sample: int = 2000) -> dict[str, int]:
+        """The `jurisdiction` values actually present in the index, counted.
+
+        corpus_jurisdictions() answers "how much does each scope have?", and
+        so can only ever report the two values the scope filter looks for.
+        This answers the different question a mis-tagged index raises —
+        "then what IS in there?" — which is what turns a metadata mismatch
+        from visible into diagnosable. Samples rather than scans: it exists
+        to fill in an error message, and an exact count of a value that
+        should not be there buys nothing over knowing that it is there.
+        """
+        try:
+            got = self.store.collection.get(limit=sample, include=["metadatas"])
+        except Exception:  # pragma: no cover - defensive
+            logging.getLogger(__name__).exception("could not sample jurisdictions")
+            return {}
+        counts: dict[str, int] = {}
+        for meta in got.get("metadatas") or []:
+            value = (meta or {}).get("jurisdiction")
+            key = "<missing>" if value is None else repr(value)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    # ------------------------------------------------------------------
+    # Views over what the pipeline already produces
+    #
+    # Nothing below adds a second answer path. Each method reads data the
+    # system has already computed -- the corpus manifest, the audit trail,
+    # the compliance graph -- and shapes it for one page. A trust surface
+    # that recomputed its own version of the answer would be showing the
+    # user something other than what they were told, which is the opposite
+    # of what it is for.
+    # ------------------------------------------------------------------
+
+    def chunk_counts_by_act(self) -> dict[str, int]:
+        """How many chunks each act_name contributed to the index.
+
+        Degrades to {} rather than raising: the sources page is still
+        worth showing without the counts, and an unbuilt index is a normal
+        state on a fresh clone.
+        """
+        counts: dict[str, int] = {}
+        try:
+            got = self.store.collection.get(include=["metadatas"])
+        except Exception:  # pragma: no cover - defensive
+            logging.getLogger(__name__).exception("could not count chunks per act")
+            return {}
+        for meta in got.get("metadatas") or []:
+            act = (meta or {}).get("act_name")
+            if act:
+                counts[act] = counts.get(act, 0) + 1
+        return counts
+
+    def corpus_documents(self) -> list[dict[str, Any]]:
+        """The corpus library, straight from ai/corpus.yaml.
+
+        `source_url` is passed through as None when the manifest has none,
+        and the UI says "no public link" rather than hiding the row. The
+        manifest's own header is explicit that a document we cannot link
+        is still a document we answer from, and a library that quietly
+        dropped those would misrepresent how much of the corpus is
+        verifiable by the reader.
+        """
+        import yaml
+
+        path = Path(settings.corpus_manifest_path)
+        if not path.is_file():
+            return []
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        counts = self.chunk_counts_by_act()
+        documents = []
+        for entry in data.get("documents") or []:
+            act_name = entry.get("act_name")
+            documents.append({
+                "act_name": act_name,
+                "file": entry.get("file"),
+                "status": entry.get("status") or "unknown",
+                "jurisdiction": entry.get("jurisdiction"),
+                "instrument_type": entry.get("instrument_type"),
+                "effective_date": entry.get("effective_date"),
+                "source_url": entry.get("source_url"),
+                "access": entry.get("access") or "public",
+                # Absent for a `pending` document, which is listed because
+                # the graph cites it, not because we hold the text.
+                "chunks": counts.get(act_name, 0),
+                "section_effective_dates": entry.get("section_effective_dates") or {},
+            })
+        return documents
+
+    def status(self) -> dict[str, Any]:
+        """What is actually running, as opposed to what is configured.
+
+        The distinction matters here more than it usually does. The
+        embedder is chosen by which artifact sits beside the index, not by
+        EMBEDDING_MODEL (see the `embedder` property), and generation falls
+        back to canned prose when no API key is set. Both of those are
+        honest degradations, and both are invisible unless something says
+        so out loud.
+        """
+        from ai.embedder import TfidfEmbedder
+
+        info: dict[str, Any] = {
+            "configured_embedding_model": settings.embedding_model,
+            "abstain_threshold": settings.abstain_threshold,
+            "default_top_k": settings.top_k,
+            # "live" once a key is configured; "mock" means answer prose is
+            # a deterministic stand-in and the UI must keep saying so.
+            "generation_mode": "live" if settings.groq_api_key else "mock",
+            "llm_model": settings.llm_model if settings.groq_api_key else None,
+            "translation_configured": bool(
+                settings.bhashini_api_key and settings.bhashini_user_id
+            ),
+        }
+        try:
+            embedder = self.embedder
+            info["active_embedding_model"] = getattr(
+                embedder, "name", settings.embedding_model
+            )
+            info["embedding_dimension"] = getattr(embedder, "dimension", None)
+            # The fallback backend is gated to exactly this case, and a
+            # user comparing two answers deserves to know which vector
+            # space produced them.
+            info["embedding_is_fallback"] = isinstance(embedder, TfidfEmbedder)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.getLogger(__name__).exception("could not describe the embedder")
+            info["active_embedding_model"] = None
+            info["embedding_dimension"] = None
+            info["embedding_is_fallback"] = None
+            info["embedder_error"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            info["chunks"] = self.corpus_count()
+            info["index_ready"] = info["chunks"] > 0
+            info["collection"] = self.store.collection.name
+        except Exception as exc:
+            info["chunks"] = 0
+            info["index_ready"] = False
+            info["collection"] = settings.chroma_collection
+            info["index_error"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            info["audit_entries"] = self.audit.count()
+        except Exception:  # pragma: no cover - defensive
+            info["audit_entries"] = None
+        return info
+
+    def evidence(self, audit_id: str) -> dict[str, Any] | None:
+        """Reconstruct why one answer came out the way it did.
+
+        Reads the audit row written when the answer was given, and joins
+        the recorded chunk scores back to the chunk text and the corpus
+        manifest. Nothing is re-retrieved: ranking the query again today
+        would rank it against today's corpus, and presenting that as the
+        reason for yesterday's answer would be a fabrication with the shape
+        of an explanation.
+
+        Rows written before retrieval detail was recorded come back with
+        `detail_recorded: False` and no per-chunk scores, rather than with
+        zeros -- "not recorded" and "scored zero" are different claims.
+        """
+        import json
+
+        try:
+            row = self.audit.get(audit_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(f"audit trail unavailable: {exc}") from exc
+        if row is None:
+            return None
+
+        def _load(value: str | None, default: Any) -> Any:
+            if not value:
+                return default
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError):
+                return default
+
+        detail = _load(row.get("retrieval_detail"), None)
+        matched_ids = _load(row.get("matched_chunk_ids"), [])
+        citations = _load(row.get("citations"), [])
+
+        # Chunk text lives in the index, not in the audit trail (the trail
+        # records identifiers so it does not become a second copy of the
+        # corpus). Look up whatever is still there; a chunk removed by a
+        # later re-ingest is reported as missing rather than silently
+        # dropped, since "this answer cited something no longer in the
+        # corpus" is exactly the kind of thing an evidence view exists to
+        # make visible.
+        texts: dict[str, dict[str, Any]] = {}
+        ids = [d.get("chunk_id") for d in detail] if detail else list(matched_ids)
+        ids = [i for i in ids if i]
+        if ids:
+            try:
+                got = self.store.collection.get(
+                    ids=ids, include=["documents", "metadatas"]
+                )
+                for i, chunk_id in enumerate(got.get("ids") or []):
+                    documents = got.get("documents") or []
+                    metadatas = got.get("metadatas") or []
+                    texts[chunk_id] = {
+                        "text": documents[i] if i < len(documents) else None,
+                        "metadata": (metadatas[i] if i < len(metadatas) else None) or {},
+                    }
+            except Exception:  # pragma: no cover - defensive
+                logging.getLogger(__name__).exception(
+                    "could not load chunk text for audit %s", audit_id
+                )
+
+        chunks = []
+        for entry in (detail or [{"chunk_id": i} for i in ids]):
+            chunk_id = entry.get("chunk_id")
+            found = texts.get(chunk_id)
+            metadata = (found or {}).get("metadata", {})
+            chunks.append({
+                "chunk_id": chunk_id,
+                "act_name": entry.get("act_name") or metadata.get("act_name"),
+                "section": entry.get("section") or metadata.get("section"),
+                "jurisdiction": entry.get("jurisdiction") or metadata.get("jurisdiction"),
+                # None, not 0.0, when the score was never recorded.
+                "similarity_score": entry.get("similarity_score"),
+                "source_url": entry.get("source_url") or metadata.get("source_url"),
+                "text": (found or {}).get("text"),
+                "still_in_corpus": found is not None,
+            })
+
+        # Citation validation: a citation the retrieved chunks do not
+        # support is the failure this project exists to catch, so it is
+        # counted rather than assumed away.
+        retrieved_pairs = {
+            (c["act_name"], c["section"]) for c in chunks
+            if c.get("act_name") and c.get("section")
+        }
+        validated = []
+        for citation in citations:
+            pair = (citation.get("act_name"), citation.get("section"))
+            validated.append({
+                "act_name": citation.get("act_name"),
+                "section": citation.get("section"),
+                "source_url": citation.get("source_url"),
+                "verified": pair in retrieved_pairs,
+            })
+
+        return {
+            "audit_id": row.get("id"),
+            "timestamp": row.get("ts"),
+            "query_text": row.get("query_text"),
+            "jurisdiction": row.get("jurisdiction"),
+            "formulation_type": row.get("formulation_type"),
+            "top_k": row.get("top_k"),
+            "confidence": row.get("confidence"),
+            "abstained": bool(row.get("should_abstain")),
+            "abstain_threshold": settings.abstain_threshold,
+            "llm_model": row.get("llm_model"),
+            "error": row.get("error"),
+            "chunks": chunks,
+            "citations": validated,
+            "citations_verified": sum(1 for c in validated if c["verified"]),
+            "citations_total": len(validated),
+            "licensed_acts_withheld": _load(row.get("licensed_acts_withheld"), []),
+            # False means this row predates per-chunk score recording, not
+            # that retrieval found nothing.
+            "detail_recorded": detail is not None,
+        }
+
+    def retrieve(
+        self,
+        query: str,
+        classification: Classification | None,
+        top_k: int,
+    ) -> tuple[RetrievalResult, dict[str, dict]]:
+        """Query the persistent Chroma index and calculate the team's
+        confidence/abstention result without rebuilding the entire corpus.
+        """
+        jurisdiction = classification.jurisdiction if classification else None
+        formulation_type = classification.formulation_type if classification else None
+
+        result = self.store.query(
+            query=query,
+            embedder=self.embedder,
+            jurisdiction=jurisdiction,
+            formulation_type=formulation_type,
+            top_k=top_k,
+        )
+
+        matched = [
+            MatchedChunk(
+                chunk_id=item["chunk_id"],
+                text=item["text"],
+                act_name=item["act_name"],
+                section=item["section"],
+                jurisdiction=item["jurisdiction"],
+                similarity_score=item["similarity_score"],
+                instrument_type=item.get("instrument_type"),
+            )
+            for item in result["matches"]
+        ]
+        confidence, should_abstain = compute_confidence(
+            query=query,
+            matched_chunks=matched,
+            threshold=settings.abstain_threshold,
+            # Defense-in-depth only — store.query() above already filtered
+            # by this jurisdiction, so this should never actually change
+            # anything in normal operation. See compute_confidence's
+            # docstring.
+            expected_jurisdiction=jurisdiction,
+        )
+
+        retrieval = RetrievalResult(
+            query=query,
+            matched_chunks=matched,
+            confidence=confidence,
+            should_abstain=should_abstain,
+        )
+        source_map = {item["chunk_id"]: item for item in result["matches"]}
+        return retrieval, source_map
+
+    def compliance(
+        self,
+        classification: Classification | None,
+        facts: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """ABS screening off the same classification retrieval already used.
+
+        Runs on every query rather than behind a separate endpoint. Someone
+        who does not know section 6 of the Biological Diversity Act exists
+        will never think to ask for an ABS check, and that person is exactly
+        who the flag is for.
+
+        Failure here degrades to None rather than propagating: a screening
+        that could not run must not take down an answer the user can still
+        use. The absent key is the signal; the API never emits an empty
+        report that would render as "nothing to worry about".
+        """
+        if classification is None and not facts:
+            log.info("compliance_screening=skipped reason=no_classification_or_facts")
+            return None
+        try:
+            assessor = get_assessor(str(REPO_ROOT / "ai" / "corpus.yaml"))
+            report = assessor.assess_from_classification(
+                classification, **(facts or {})
+            )
+            result = report.to_dict()
+            # Structured, greppable, and carrying no free text from the
+            # request: the jurisdiction and formulation type are closed
+            # vocabularies, and the status/obligation count are the
+            # screening's own output. An ABS obligation that fired and
+            # was never acted on is the kind of thing that gets
+            # reconstructed from logs months later, so the decision is
+            # recorded at the point it is made rather than only in the
+            # response body the user may never have read.
+            obligations = result.get("obligations") or []
+            log.info(
+                "compliance_screening=ran jurisdiction=%s formulation_type=%s "
+                "status=%s obligations=%d",
+                (classification.jurisdiction if classification else None),
+                (classification.formulation_type if classification else None),
+                result.get("status"),
+                len(obligations),
+            )
+            return result
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("compliance_screening=failed error=%s", exc)
+            return None
+
+    def _render_gate_reply(
+        self, answer_text: str, target_lang: str
+    ) -> tuple[str, str, str]:
+        """Translate a domain-gate refusal/clarification into the
+        requester's language and report what actually happened.
+
+        Returns (answer_text, disclaimer, translation_status).
+
+        A refusal is still an answer as far as the person reading it is
+        concerned. Handing someone an English sentence while the API
+        reports translation_status="not_required" is the same lie as
+        reporting translated=true on a failed Bhashini call, just on a
+        shorter string — so the gate paths go through the same
+        translate-and-say-what-happened treatment as a real answer. The
+        two strings share one status because they are translated by the
+        same backend in the same request; if the disclaimer could not be
+        translated, neither could the body.
+        """
+        rendered = translate_answer_from_english(
+            answer_text, translator=self.translator, target_lang=target_lang
+        )
+        disclaimer = translate_answer_from_english(
+            "This is informational, not legal advice.",
+            translator=self.translator,
+            target_lang=target_lang,
+        )
+        return rendered.text, disclaimer.text, translation_status(rendered)
+
+    @staticmethod
+    def resolve_scope(
+        scope: str | None, classification: Classification | None
+    ) -> str:
+        """Which jurisdictions a query is answered from.
+
+        An explicit scope wins. Absent one, a classification that already
+        names a jurisdiction is honoured — that is how every caller written
+        before the toggle existed passed this, and silently widening those
+        to BOTH would change their answers. Otherwise BOTH: the default
+        must not force a jurisdiction choice out of someone who has not
+        been asked one.
+        """
+        if scope in SCOPE_JURISDICTION or scope == "BOTH":
+            return scope
+        if classification is not None and classification.jurisdiction:
+            for code, jurisdiction in SCOPE_JURISDICTION.items():
+                if classification.jurisdiction == jurisdiction:
+                    return code
+        return "BOTH"
+
+    def _answer_for_scope(
+        self,
+        english_query: str,
+        scope: str,
+        classification: Classification | None,
+        top_k: int,
+        consented_acts: set[str] | None,
+    ) -> dict[str, Any]:
+        """Retrieve and generate within one jurisdiction, and nothing else.
+
+        The jurisdiction is pushed down into the Chroma metadata filter, so
+        chunks from the other jurisdiction are never eligible to be
+        retrieved — the boundary is enforced before ranking, not by asking
+        the model to be careful afterwards. The generator is then told which
+        jurisdiction it is answering under and instructed not to reach
+        outside it, which is the guardrail against the model's own training
+        knowledge filling in what retrieval deliberately excluded.
+        """
+        jurisdiction = SCOPE_JURISDICTION[scope]
+        label = SCOPE_LABEL[scope]
+
+        # Carry the scope in as a Classification rather than as a separate
+        # argument: retrieve() already reads its jurisdiction from there, so
+        # the filter reaches the store by the path it always has.
+        scoped = (
+            replace(classification, jurisdiction=jurisdiction)
+            if classification is not None
+            else Classification(jurisdiction=jurisdiction)
+        )
+        retrieval, source_map = self.retrieve(english_query, scoped, top_k)
+
+        insufficient = retrieval.should_abstain
+        generation_mode = "none"
+
+        # "The corpus does not cover your question" and "there is no corpus"
+        # are different failures and must not share a message. An unbuilt
+        # index abstains on everything at 0% confidence, which reads exactly
+        # like a well-behaved out-of-scope answer -- so a user sees the same
+        # reply to every question and reasonably concludes the product is
+        # broken, when the actual fix is one ingest command. Telling them
+        # their question was out of scope, when nothing was ever searched,
+        # is the kind of confidently wrong answer this system exists to
+        # avoid; it just happens to be about itself.
+        corpus_empty = insufficient and self.corpus_count() == 0
+
+        if insufficient:
+            # Nothing in this jurisdiction matched well enough. Do not let
+            # the model fill the gap from its own knowledge — the whole
+            # point of the filter is that an answer here would be
+            # ungrounded. Name the other scope instead, since a question
+            # with no Indian answer very often has an international one.
+            other = "International" if scope == "IN" else "India"
+            from ai.shared.schema import FinalAnswer
+
+            final = FinalAnswer(
+                answer_text=(
+                    "The search index has not been built, so there is nothing "
+                    "to search. No question can be answered until the corpus "
+                    "is ingested — this is not a limit of the corpus\'s "
+                    "coverage. Run: python -m ai.cli data/pdfs --manifest "
+                    "ai/corpus.yaml --model tfidf"
+                ) if corpus_empty else (
+                    f"I don't have {label}-specific guidance on this in the "
+                    f"corpus, so I can't answer it from {label} sources. "
+                    f"Try the {other} scope, or Both."
+                ),
+                citations=[],
+                confidence=retrieval.confidence,
+                abstained=True,
+                disclaimer="This is informational, not legal advice.",
+            )
+        else:
+            # Without a key the LLM step cannot run. When demo_mode is on
+            # (the default) we fall back to the deterministic MockLLM so
+            # retrieval, citations and the compliance screening stay
+            # demonstrable — but a canned paragraph presented as a
+            # generated answer would be precisely the dishonesty this
+            # system exists to prevent, so the mode is reported in the
+            # response and the UI must surface it. When demo_mode is
+            # explicitly turned off, a missing key is a hard failure
+            # instead of a silent fallback: an operator relying on live
+            # generation in production should see "unavailable", not
+            # get demo prose without knowing it.
+            if not settings.groq_api_key and not settings.demo_mode:
+                from ai.shared.schema import FinalAnswer
+
+                final = FinalAnswer(
+                    answer_text=(
+                        "Live answer generation is not configured "
+                        "(GROQ_API_KEY is missing and DEMO_MODE is off), so "
+                        "no answer can be generated for this query."
+                    ),
+                    citations=[],
+                    confidence=retrieval.confidence,
+                    abstained=True,
+                    disclaimer="This is informational, not legal advice.",
+                )
+                generation_mode = "unavailable"
+                insufficient = True
+            else:
+                use_mock = not settings.groq_api_key
+                final = generate_answer(
+                    retrieval,
+                    model=settings.llm_model,
+                    mock=use_mock,
+                    api_key=settings.groq_api_key,
+                    jurisdiction_label=label,
+                )
+                generation_mode = "mock" if use_mock else "live"
+
+        # Keep source metadata from retrieval for the UI. Generation uses
+        # the existing Shape-3/Shape-4 contract and therefore does not
+        # change those team-owned field names.
+        sources = []
+        for c in retrieval.matched_chunks:
+            meta = source_map.get(c.chunk_id, {})
+            sources.append({
+                "chunk_id": c.chunk_id,
+                "act_name": c.act_name,
+                "section": c.section,
+                "jurisdiction": c.jurisdiction,
+                "similarity_score": c.similarity_score,
+                "source_url": meta.get("source_url"),
+            })
+
+        citations = []
+        for c in final.citations:
+            url = next(
+                (s["source_url"] for s in sources
+                 if s["act_name"] == c.act_name and s["section"] == c.section),
+                None,
+            )
+            citations.append({
+                "act_name": c.act_name,
+                "section": c.section,
+                "source_url": url,
+            })
+
+        # Withhold any citation/source drawn from a licensed act the
+        # request hasn't consented to. See ai/audit.py — this never
+        # touches retrieval itself (the model can still reason over a
+        # licensed chunk's text), only what is disclosed in the response.
+        gate = self.audit.gate_citations(
+            {s["act_name"] for s in sources}, consented_acts=consented_acts
+        )
+        if gate.licensed_withheld:
+            withheld = set(gate.licensed_withheld)
+            sources = [s for s in sources if s["act_name"] not in withheld]
+            citations = [c for c in citations if c["act_name"] not in withheld]
+
+        return {
+            "scope": scope,
+            "label": label,
+            "final": final,
+            "retrieval": retrieval,
+            "sources": sources,
+            "citations": citations,
+            "gate": gate,
+            "generation": generation_mode,
+            "insufficient": insufficient,
+            "corpus_empty": corpus_empty,
+        }
+
+    def answer(
+        self,
+        query: str,
+        classification: Classification | None,
+        top_k: int,
+        compliance_facts: dict[str, Any] | None = None,
+        consented_acts: set[str] | None = None,
+        language: str | None = None,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        formulation_type = classification.formulation_type if classification else None
+        resolved_scope = self.resolve_scope(scope, classification)
+
+        # Translate to English FIRST — before the domain gate, before
+        # retrieval. ai/embedder.py's default model is English-only, so
+        # this is what makes retrieval work at all for a non-English
+        # query rather than a UX nicety (see ai/translation.py's module
+        # docstring). `language` is the caller-supplied or detected
+        # source language; retrieval and generation run on the English
+        # text throughout, and the answer translates back at the end.
+        #
+        # The ordering matters and used to be wrong. The domain gate ran
+        # on the RAW query, and its vocabulary list, its chit-chat
+        # patterns and its emptiness check are all English. A Hindi or
+        # Kannada question therefore matched nothing, tokenised to
+        # nothing under the old ASCII-only tokeniser, and was refused as
+        # "no_meaningful_terms" before it ever reached translation — so
+        # every query in every language this product exists to serve,
+        # except English, came back as "Outside supported scope". The
+        # gate has to see English to judge English. Translation is not
+        # the expensive step the gate was placed early to avoid (that is
+        # embedding + retrieval + the LLM, all still downstream of it),
+        # and for an English query it is an identity no-op, so moving the
+        # gate after it costs nothing and fixes the multilingual path.
+        query_translation = translate_query_to_english(
+            query, translator=self.translator, language=language
+        )
+        source_language = query_translation.source_lang
+        english_query = query_translation.text
+        # Without a configured Bhashini backend the "English" query is
+        # still the original Hindi/Kannada text. The gate must not then
+        # read its own failure to recognise that text as evidence the
+        # user asked something off-topic, so a query we could not
+        # translate is passed through to retrieval and left to the
+        # evidence layer, which will abstain honestly on no coverage.
+        #
+        # The test is what script the text is actually in, not what
+        # `language` claimed. A caller that mislabels English text as
+        # Hindi should still get gated; a Devanagari query that Bhashini
+        # turned into English should too. Trusting the declared language
+        # instead would hand both of those the wrong answer.
+        query_is_english = detect_language(english_query) == "en"
+
+        # Domain/intent gate — runs before retrieval and generation. See
+        # ai/person_b_retrieval/domain_gate.py. This is what stops "how
+        # are you" from reaching the embedder or the LLM at all: no
+        # vector search is cheap enough to be worth running on a message
+        # that plainly is not an IP/AYUSH/TK/biodiversity question, and
+        # running it anyway is how an unrelated document ends up looking
+        # like "evidence" for a question that was never actually asked
+        # (see confidence.py's coverage fix for the other half of that
+        # same failure mode).
+        decision = (
+            classify_domain(english_query)
+            if query_is_english
+            else DomainDecision(QueryDomain.IN_DOMAIN, "untranslated_non_english_query")
+        )
+        # Structured, greppable, and deliberately free of the query text
+        # itself or any credentials — see module docstring in
+        # domain_gate.py for what "domain_gate" as a reason means.
+        log.info(
+            "query_domain=%s abstention_reason=%s",
+            decision.domain.value,
+            decision.reason if decision.domain is not QueryDomain.IN_DOMAIN else "n/a",
+        )
+
+        if decision.domain is QueryDomain.OUT_OF_DOMAIN:
+            # These two strings are written in English, so on a non-English
+            # request they need the same translation treatment — and the
+            # same honesty about it — as a real answer. The previous code
+            # hardcoded translated=True / "not_required" here, which told a
+            # Hindi speaker that nothing needed translating while handing
+            # them an English refusal.
+            answer_text, disclaimer, gate_status = self._render_gate_reply(
+                "Outside supported scope. IP-SAKTI Sahayak is designed for "
+                "intellectual-property, AYUSH, traditional-knowledge, "
+                "biodiversity/ABS and related regulatory questions. Try, "
+                "for example: \"What kinds of subject matter cannot be "
+                "patented in India?\"",
+                source_language,
+            )
+            audit_id = self._log_query_safe(
+                query_text=query,
+                jurisdiction=None,
+                formulation_type=formulation_type,
+                top_k=top_k,
+                matched_chunk_ids=[],
+                confidence=0.0,
+                should_abstain=True,
+                citations=[],
+                gate=None,
+                disclaimer_shown=True,
+                llm_model=None,
+            )
+            return {
+                "answer_text": answer_text,
+                "citations": [],
+                "confidence": 0.0,
+                "abstained": True,
+                "abstention_reason": "out_of_domain",
+                "evidence_strength": "insufficient",
+                # Nothing was retrieved, so the raw score is a true zero
+                # rather than an absent value. See schemas.py.
+                "evidence_score": 0.0,
+                "jurisdiction": _scope_jurisdiction(resolved_scope),
+                "disclaimer": disclaimer,
+                "sources": [],
+                "compliance": None,
+                "licensed_sources_withheld": [],
+                "audit_id": audit_id,
+                "generation": "none",
+                "generation_provider": None,
+                "retrieval_model": None,
+                # Deliberately not self.confidence_calibrated: that property
+                # lazily loads the embedder to check its CALIBRATED flag,
+                # and the domain gate's entire point is to answer without
+                # ever touching the embedder or the vector store for a
+                # query that was rejected before retrieval. confidence is
+                # 0.0 here regardless of which embedder is configured, so
+                # there is nothing for the flag to qualify.
+                "confidence_calibrated": True,
+                "language": source_language,
+                # Honest, not hardcoded: "not_required" only when the
+                # requester already wanted English, "translated" only when
+                # a backend actually ran, "unavailable"/"failed" otherwise.
+                "translated": gate_status in ("not_required", "translated"),
+                "translation_status": gate_status,
+                "target_language": source_language,
+                "scope": resolved_scope,
+                "answers": [],
+            }
+
+        if decision.domain is QueryDomain.AMBIGUOUS:
+            answer_text, disclaimer, gate_status = self._render_gate_reply(
+                "I need a little more information. What are you trying to "
+                "protect: " + ", ".join(decision.clarification_options) + "?",
+                source_language,
+            )
+            audit_id = self._log_query_safe(
+                query_text=query,
+                jurisdiction=None,
+                formulation_type=formulation_type,
+                top_k=top_k,
+                matched_chunk_ids=[],
+                confidence=0.0,
+                should_abstain=True,
+                citations=[],
+                gate=None,
+                disclaimer_shown=True,
+                llm_model=None,
+            )
+            return {
+                "answer_text": answer_text,
+                "citations": [],
+                "confidence": 0.0,
+                "abstained": True,
+                "abstention_reason": "ambiguous",
+                "evidence_strength": "insufficient",
+                # Nothing was retrieved, so the raw score is a true zero
+                # rather than an absent value. See schemas.py.
+                "evidence_score": 0.0,
+                "jurisdiction": _scope_jurisdiction(resolved_scope),
+                "clarification_options": decision.clarification_options,
+                "disclaimer": disclaimer,
+                "sources": [],
+                "compliance": None,
+                "licensed_sources_withheld": [],
+                "audit_id": audit_id,
+                "generation": "none",
+                "generation_provider": None,
+                "retrieval_model": None,
+                # Deliberately not self.confidence_calibrated: that property
+                # lazily loads the embedder to check its CALIBRATED flag,
+                # and the domain gate's entire point is to answer without
+                # ever touching the embedder or the vector store for a
+                # query that was rejected before retrieval. confidence is
+                # 0.0 here regardless of which embedder is configured, so
+                # there is nothing for the flag to qualify.
+                "confidence_calibrated": True,
+                "language": source_language,
+                # Honest, not hardcoded: "not_required" only when the
+                # requester already wanted English, "translated" only when
+                # a backend actually ran, "unavailable"/"failed" otherwise.
+                "translated": gate_status in ("not_required", "translated"),
+                "translation_status": gate_status,
+                "target_language": source_language,
+                "scope": resolved_scope,
+                "answers": [],
+            }
+
+        # Compliance screening is about the applicant's own duties, not about
+        # which corpus the answer was drawn from, so it runs on every query
+        # whatever the scope — that is the entire point of it (see
+        # compliance()'s docstring: the person who needs the ABS flag is the
+        # one who does not know to ask for it). Before the jurisdiction moved
+        # onto the scope, the UI always sent jurisdiction="india" on the
+        # classification and that alone was enough to fire the screening. Now
+        # that the scope carries the jurisdiction, fill it in here, or a query
+        # with no formulation facts would silently get no screening at all.
+        compliance_classification = (
+            replace(classification, jurisdiction=classification.jurisdiction or "india")
+            if classification is not None
+            else Classification(jurisdiction="india")
+        )
+
+        # "BOTH" is two separately filtered retrievals and two separate
+        # generation calls, never one merged call. Blending them would put a
+        # Patents Act clause and a PCT rule in the same similarity ranking,
+        # where one crowds the other out or the two get stitched into a
+        # single incoherent paragraph across two legal systems.
+        targets = ["IN", "INTL"] if resolved_scope == "BOTH" else [resolved_scope]
+
+        # Retrieval filters on jurisdiction BEFORE ranking, so an index whose
+        # chunks are not tagged with these exact values has nothing eligible
+        # to return: no chunks scores 0.0, 0.0 is below the abstain
+        # threshold, and every question on every scope comes back as a
+        # confident-looking "0% confidence, I can't answer that". A broken
+        # index reported as a settled I-don't-know is precisely the failure
+        # this project exists to prevent, so say what is actually wrong.
+        #
+        # Only raise when the collection HAS content and none of it is
+        # reachable through the scopes asked for. Two cases stay off this
+        # path deliberately: an empty collection (nothing is ingested yet —
+        # already a 503 from the embedder/corpus guards, and not a metadata
+        # fault), and a scope that is empty while its sibling has content,
+        # which the `insufficient` path below handles gracefully by naming
+        # the other scope. A count that could not be taken leaves its key
+        # absent rather than reading as 0, so a transient Chroma error can
+        # never masquerade as a mis-tagged corpus.
+        targeted = [SCOPE_JURISDICTION[t] for t in targets]
+        counted = self.corpus_jurisdictions()
+        if (
+            self.corpus_count() > 0
+            and all(j in counted for j in targeted)
+            and all(counted[j] == 0 for j in targeted)
+        ):
+            present = self.corpus_jurisdiction_values()
+            raise RuntimeError(
+                f"the index holds {self.corpus_count()} chunks, but none are "
+                f"tagged with the jurisdiction(s) this scope searches "
+                f"({', '.join(targeted)}). The jurisdiction values actually in "
+                f"the index are: {present or 'none readable'}. Retrieval filters "
+                "on jurisdiction before ranking, so nothing can match and every "
+                "query would report 0% confidence. Either nothing for this "
+                "jurisdiction has been ingested yet, or the index predates the "
+                "jurisdiction scope and is tagged with different values. Check "
+                "the values above against ai/corpus.yaml, then rebuild with: "
+                "./scripts/run.sh --rebuild"
+            )
+
+        # (Query translation happened at the top of this method, before
+        # the domain gate — see the comment there for why the order
+        # matters. `english_query` and `source_language` are already set.)
+
+        try:
+            parts = [
+                self._answer_for_scope(
+                    english_query, target, classification, top_k, consented_acts
+                )
+                for target in targets
+            ]
+
+            # Translate each block's prose back to the requester's language.
+            # Never touches citations/sources — act_name is a legal
+            # identifier, not prose, and translating it would break the
+            # exact-match contract ai/corpus.yaml's header describes.
+            answers = []
+            translated_all = True
+            calibrated = self.confidence_calibrated
+            for part in parts:
+                rendered = translate_answer_from_english(
+                    part["final"].answer_text,
+                    translator=self.translator,
+                    target_lang=source_language,
+                )
+                translated_all = translated_all and rendered.translated
+                answers.append({
+                    "scope": part["scope"],
+                    "label": part["label"],
+                    "answer_text": rendered.text,
+                    "citations": part["citations"],
+                    "sources": part["sources"],
+                    "confidence": part["final"].confidence,
+                    "confidence_calibrated": calibrated,
+                    "evidence_strength": evidence_strength(
+                        part["final"].confidence, settings.abstain_threshold
+                    ),
+                    "evidence_score": part["final"].confidence,
+                    "jurisdiction": SCOPE_JURISDICTION[part["scope"]],
+                    "abstained": part["final"].abstained,
+                    "generation": part["generation"],
+                    "insufficient": part["insufficient"],
+                    "corpus_empty": part["corpus_empty"],
+                    # See translation.py's translation_status(): distinguishes
+                    # "nothing needed translating" from "Bhashini is not
+                    # configured" from "Bhashini is configured but this
+                    # request failed" — a bare True/False could not tell
+                    # those apart, and the difference changes what the
+                    # requester should conclude about the text they got back.
+                    "translation_status": translation_status(rendered),
+                })
+
+            disclaimer_translation = translate_answer_from_english(
+                "This is informational, not legal advice.",
+                translator=self.translator,
+                target_lang=source_language,
+            )
+            overall_translation_status = translation_status(disclaimer_translation)
+
+            # The flat fields below exist for callers that predate the
+            # per-jurisdiction breakdown. For a single scope they are that
+            # scope's answer verbatim; for BOTH they are the two blocks
+            # under explicit headings — labelled, never run together into
+            # one paragraph, for the same reason the UI keeps them apart.
+            if len(answers) == 1:
+                answer_text = answers[0]["answer_text"]
+            else:
+                answer_text = "\n\n".join(
+                    f"{a['label']}\n{a['answer_text']}" for a in answers
+                )
+
+            citations = _dedupe_citations(answers)
+            sources = _dedupe_sources(answers)
+            abstained = all(a["abstained"] for a in answers)
+            confidence = max((a["confidence"] for a in answers), default=0.0)
+            # "live" beats "mock" beats "none": what the user needs to know
+            # is whether ANY prose in front of them is a canned stand-in,
+            # and the per-block generation field says which.
+            modes = {a["generation"] for a in answers}
+            generation = (
+                "live" if "live" in modes
+                else "mock" if "mock" in modes
+                # A part reaching "unavailable" (GROQ_API_KEY missing and
+                # DEMO_MODE=false — see _answer_for_scope) is meaningfully
+                # different from "none" (nothing to generate because
+                # retrieval/evidence never got far enough to try): losing
+                # that distinction here would silently collapse "the
+                # system would have answered but generation is turned off"
+                # into "there was nothing to answer", which is exactly the
+                # kind of ambiguity the generation-state contract exists
+                # to prevent.
+                else "unavailable" if "unavailable" in modes
+                else "none"
+            )
+            withheld = sorted({
+                act for part in parts for act in part["gate"].licensed_withheld
+            })
+
+            audit_id = self._log_query_safe(
+                query_text=query,
+                jurisdiction=",".join(SCOPE_JURISDICTION[t] for t in targets),
+                formulation_type=formulation_type,
+                top_k=top_k,
+                matched_chunk_ids=[
+                    c.chunk_id for part in parts
+                    for c in part["retrieval"].matched_chunks
+                ],
+                confidence=confidence,
+                should_abstain=abstained,
+                citations=citations,
+                gate=parts[0]["gate"] if parts else None,
+                disclaimer_shown=True,
+                llm_model=None if abstained else settings.llm_model,
+                # Per-chunk scores are not recoverable later: re-running
+                # this query tomorrow ranks against tomorrow's corpus, not
+                # against the one that produced this answer. Recorded here
+                # or lost.
+                retrieval_detail=sources,
+            )
+
+            log.info(
+                "query_domain=in_domain evidence_strength=%s generation_mode=%s "
+                "translation_status=%s abstained=%s",
+                evidence_strength(confidence, settings.abstain_threshold),
+                generation,
+                overall_translation_status,
+                abstained,
+            )
+
+            return {
+                "answer_text": answer_text,
+                "citations": citations,
+                "confidence": confidence,
+                "abstained": abstained,
+                # None when an answer was produced. When every scope
+                # abstained, this is "insufficient_evidence" — distinct from
+                # the domain-gate's "out_of_domain"/"ambiguous" reasons
+                # returned earlier in this method, since those never reach
+                # retrieval at all.
+                "abstention_reason": "insufficient_evidence" if abstained else None,
+                "evidence_strength": evidence_strength(confidence, settings.abstain_threshold),
+                # The same number as "confidence" above, under a name that
+                # does not invite being read as a probability. See
+                # schemas.py QueryResponse.evidence_score.
+                "evidence_score": confidence,
+                "jurisdiction": _scope_jurisdiction(resolved_scope),
+                "disclaimer": disclaimer_translation.text,
+                "sources": sources,
+                # Attached even when retrieval abstained. Abstention means the
+                # corpus could not answer the question asked; it says nothing
+                # about whether an ABS obligation applies, and those are
+                # decided by the graph rather than by retrieval.
+                "compliance": self.compliance(compliance_classification, compliance_facts),
+                "licensed_sources_withheld": withheld,
+                "audit_id": audit_id,
+                # "live" (a real model call), "mock" (no API key configured —
+                # the prose is canned, the citations and screening are not),
+                # or "none" (abstained, so no generation happened).
+                "generation": generation,
+                # "groq" only when generation actually ran live; "demo" for
+                # the deterministic mock fallback (still a "provider" in the
+                # sense that something produced the prose, just not an
+                # LLM); None when nothing generated anything at all.
+                "generation_provider": {
+                    "live": "groq", "mock": "demo", "none": None,
+                }.get(generation, None),
+                # The embedder actually used for this retrieval — not
+                # necessarily settings.embedding_model, since the active
+                # embedder is determined by which artifact sits beside the
+                # persisted index (see AIService.status()'s own docstring
+                # for why those two can differ).
+                "retrieval_model": getattr(self.embedder, "name", None),
+                "confidence_calibrated": calibrated,
+                "language": source_language,
+                # False means the text above is still English because no
+                # translation backend is configured or it failed — the
+                # answer is still correct, just not delivered in the
+                # requester's language. See ai/translation.py. Kept for
+                # backward compatibility; prefer translation_status below,
+                # which distinguishes *why* it is False.
+                "translated": translated_all,
+                # "not_required" (source==target already), "translated",
+                # "unavailable" (no Bhashini credentials configured), or
+                # "failed" (Bhashini is configured but this request broke).
+                "translation_status": overall_translation_status,
+                "target_language": source_language,
+                "scope": resolved_scope,
+                "answers": answers,
+            }
+        except Exception as exc:
+            # A query that blew up is exactly the kind of event an audit
+            # trail exists to capture — log it (best-effort) and let the
+            # caller's own error handling take it from here.
+            self._log_query_safe(
+                query_text=query,
+                jurisdiction=",".join(SCOPE_JURISDICTION[t] for t in targets),
+                formulation_type=formulation_type,
+                top_k=top_k,
+                matched_chunk_ids=[],
+                confidence=None,
+                should_abstain=True,
+                citations=[],
+                gate=None,
+                disclaimer_shown=False,
+                llm_model=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+
+    def _log_query_safe(self, **kwargs: Any) -> str | None:
+        """Write an audit row without letting a logging failure take down
+        the request it is trying to record. The absent audit_id is the
+        signal something is wrong with the audit store itself, which is an
+        operational problem to alert on, not a reason to refuse an answer
+        the user can still use."""
+        try:
+            return self.audit.log_query(**kwargs)
+        except Exception:  # pragma: no cover - defensive
+            logging.getLogger(__name__).exception("audit logging failed")
+            return None
+
+
+def _dedupe_citations(answers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Union of every block's citations, order preserved, duplicates dropped.
+
+    A citation is identified by (act_name, section) — the same pair the
+    corpus manifest treats as a contract — so the same provision reached
+    from two jurisdictions is listed once.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for a in answers:
+        for c in a["citations"]:
+            key = (c["act_name"], c["section"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def _dedupe_sources(answers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Union of every block's retrieved chunks, keyed by chunk_id."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for a in answers:
+        for s in a["sources"]:
+            if s["chunk_id"] in seen:
+                continue
+            seen.add(s["chunk_id"])
+            out.append(s)
+    return out
+
+
+ai_service = AIService()

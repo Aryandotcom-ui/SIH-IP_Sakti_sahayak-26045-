@@ -1,0 +1,118 @@
+# Render blueprint for the API (free tier). Netlify serves the web UI;
+# this serves everything under /api/v1.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repository.
+# Then set the two secrets marked sync:false below.
+#
+# Free-tier caveats, both real:
+#  - The service sleeps after ~15 minutes idle, so the first request after
+#    a quiet spell waits ~50s for a cold start. The UI's fetch timeout is
+#    12s, so that first request shows the sample-data banner; a reload
+#    once the service is awake gets real answers.
+#  - 512MB RAM. The index is ~200MB on disk and Chroma memory-maps it, so
+#    this fits, but there is not much headroom.
+
+services:
+  - type: web
+    name: ip-sakti-api
+    runtime: python
+    plan: free
+    region: singapore          # closest free region to the users
+    rootDir: .
+    buildCommand: |
+      set -euo pipefail
+      pip install --upgrade pip
+      pip install -r backend/requirements.txt
+      # The index is not in version control: it derives from data/pdfs and
+      # rebuilds in about a minute. Building it here rather than shipping
+      # it keeps the repository small and the index always matching the
+      # corpus that produced it.
+      #
+      # `set -euo pipefail` above is load-bearing: without it a non-zero
+      # exit from ai.cli (no PDFs found, embedder failure, a bad file) does
+      # not fail this multi-line script, and Render deploys an API that
+      # starts up looking healthy while abstaining on every question at 0%
+      # confidence, forever. Fail the deploy instead of shipping that.
+      python -m ai.cli data/pdfs --manifest ai/corpus.yaml --model tfidf
+      # count > 0 alone does not prove retrieval works: a corrupted or
+      # mis-fitted index can hold vectors and still return zero matches.
+      # Load the same TF-IDF artifact production will load and run one
+      # real retrieval query before letting Render call this a success.
+      python -c "
+      import sys
+      from pathlib import Path
+      from ai.embedder import TfidfEmbedder
+      from ai.store import VectorStore
+
+      chroma_dir = Path('data/chroma')
+
+      count = VectorStore(chroma_dir, collection='ip_sakti_corpus').count()
+      print(f'post-build index count: {count}')
+      if count == 0:
+          print('RAG build smoke test FAILED: empty index', file=sys.stderr)
+          sys.exit(1)
+
+      artifact = chroma_dir / TfidfEmbedder.ARTIFACT_NAME
+      if not artifact.exists():
+          print(f'RAG build smoke test FAILED: missing {artifact}', file=sys.stderr)
+          sys.exit(1)
+
+      embedder = TfidfEmbedder.load(chroma_dir)
+      store = VectorStore(chroma_dir, collection='ip_sakti_corpus')
+      result = store.query(
+          query='What kinds of subject matter cannot be patented in India?',
+          embedder=embedder,
+          jurisdiction='india',
+          top_k=5,
+      )
+      matches = len(result['matches'])
+      print(f'smoke-test retrieval matches: {matches}')
+      if matches == 0:
+          print('RAG build smoke test FAILED: zero retrieval matches', file=sys.stderr)
+          sys.exit(1)
+
+      print('RAG build smoke test passed')
+
+      # Negative smoke test: an off-topic query must not be treated as a
+      # confident legal match. This exercises the domain gate + the fixed
+      # empty-query-terms behaviour in ai/person_b_retrieval/confidence.py,
+      # not just the index build.
+      from ai.person_b_retrieval.domain_gate import QueryDomain, classify_domain
+      from ai.person_b_retrieval.confidence import compute_confidence
+      from ai.person_b_retrieval.schema import MatchedChunk
+
+      decision = classify_domain('how are you')
+      if decision.domain is not QueryDomain.OUT_OF_DOMAIN:
+          print('Negative smoke test FAILED: domain gate did not reject chit-chat', file=sys.stderr)
+          sys.exit(1)
+
+      noise_result = store.query(query='how are you', embedder=embedder, top_k=5)
+      noise_chunks = [
+          MatchedChunk(
+              chunk_id=m['chunk_id'], text=m['text'], act_name=m['act_name'],
+              section=m['section'], jurisdiction=m['jurisdiction'],
+              similarity_score=m['similarity_score'],
+          )
+          for m in noise_result['matches']
+      ]
+      noise_confidence, noise_abstain = compute_confidence('how are you', noise_chunks)
+      if not noise_abstain:
+          print(f'Negative smoke test FAILED: confidence {noise_confidence} did not abstain', file=sys.stderr)
+          sys.exit(1)
+
+      print('Negative (abstention) smoke test passed')
+      "
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir backend
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Comma-separated. Must include the Netlify site origin, with no
+      # trailing slash, or the browser blocks every API call.
+      - key: CORS_ORIGINS
+        sync: false
+      # Without this the API still answers with real citations, sources
+      # and compliance screening; only the prose is a canned stand-in,
+      # and the UI labels it as such.
+      - key: GROQ_API_KEY
+        sync: false

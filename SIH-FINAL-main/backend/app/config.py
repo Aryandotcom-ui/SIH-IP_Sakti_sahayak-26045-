@@ -1,0 +1,154 @@
+from functools import lru_cache
+from pathlib import Path
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from typing import Annotated
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    app_name: str = "IP-SAKTI Sahayak API"
+    api_v1_prefix: str = "/api/v1"
+    # pydantic-settings normally expects JSON for list-valued environment
+    # variables. We intentionally use a comma-separated value in .env for
+    # developer friendliness, so disable automatic JSON decoding and parse it.
+    cors_origins: Annotated[list[str], NoDecode] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ]
+
+    # Resolve the default corpus relative to the repository, not the process cwd.
+    chroma_path: str = str(REPO_ROOT / "data" / "chroma")
+    chroma_collection: str = "ip_sakti_corpus"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_device: str | None = "cpu"
+    top_k: int = 5
+    abstain_threshold: float = 0.20
+
+    corpus_manifest_path: str = str(REPO_ROOT / "ai" / "corpus.yaml")
+    # Source PDFs the index is built from.
+    pdf_dir: str = str(REPO_ROOT / "data" / "pdfs")
+    # Build the index at startup when it is empty.
+    #
+    # data/chroma is a build artifact and is gitignored, so EVERY fresh
+    # clone and every deploy starts with no index. Without this the API
+    # comes up looking healthy and abstains on every question at 0%
+    # confidence, which is indistinguishable from a working product that
+    # cannot answer anything. Making the server build what it needs is the
+    # difference between "run one more command you were never told about"
+    # and "it works".
+    #
+    # Turn off where the index is mounted from a volume or baked into the
+    # image, so startup does not redo work the deploy already did.
+    auto_build_index: bool = True
+    sqlite_registry_path: str = str(REPO_ROOT / "data" / "registry.sqlite3")
+    audit_db_path: str = str(REPO_ROOT / "data" / "audit.sqlite3")
+    # DPDP storage-limitation bound for the audit trail. purge_older_than()
+    # is not scheduled by anything in this process — the auto-update
+    # pipeline's job runner (below) is the intended caller.
+    audit_retention_days: int = 180
+
+    # Auto-update pipeline (ai/updates) — source watcher + review gate.
+    updates_sources_path: str = str(REPO_ROOT / "ai" / "updates" / "sources.yaml")
+    updates_watcher_db_path: str = str(REPO_ROOT / "data" / "updates_watcher.sqlite3")
+    updates_queue_db_path: str = str(REPO_ROOT / "data" / "updates_queue.sqlite3")
+    updates_stage_dir: str = str(REPO_ROOT / "data" / "updates_incoming")
+    # Off by default: enabling this makes the process poll real external
+    # URLs on a schedule, which a shared/CI/demo deployment should opt
+    # into deliberately rather than inherit from a default.
+    updates_scheduler_enabled: bool = False
+    updates_interval_minutes: int = 60
+    # Whether AUTO_PUBLISH / PUBLISH_THEN_AUDIT tiers are ingested
+    # immediately by the scheduler and by "check now". False makes every
+    # tier land in the queue for a human to trigger ingestion on
+    # explicitly — a safer default for a first deployment.
+    updates_auto_ingest: bool = False
+
+    # Patent preparation and tracking (ai/patent_prep) — separate from the
+    # RAG core's own SQLite stores above.
+    patent_cases_db_path: str = str(REPO_ROOT / "data" / "patent_cases.sqlite3")
+
+    llm_model: str = "openai/gpt-oss-120b"
+    groq_api_key: str | None = None
+
+    # Formalizes the existing mock/live generation fallback (see
+    # AIService._answer_for_scope). True (default) keeps today's
+    # behaviour: no GROQ_API_KEY -> deterministic mock prose, clearly
+    # labelled generation="mock" in the response. Setting this False in a
+    # production deployment that expects live generation makes a missing
+    # key a hard "generation unavailable" failure instead of a silent
+    # demo fallback, so an operator cannot accidentally ship demo prose
+    # believing it is live.
+    demo_mode: bool = True
+
+    # Kept for future Claude support.
+    anthropic_api_key: str | None = None
+
+    # Multilingual request/response edge (ai/translation.py). Without both
+    # set, queries and answers pass through untranslated — see
+    # ai.translation.NullTranslator.
+    bhashini_api_key: str | None = None
+    bhashini_user_id: str | None = None
+
+    model_config = SettingsConfigDict(
+        # Support .env at the repo root and backend/.env; the latter wins.
+        env_file=(REPO_ROOT / ".env", REPO_ROOT / "backend" / ".env"),
+        env_prefix="",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+    # Every path setting below defaults to an absolute string built from
+    # REPO_ROOT, but an env override (e.g. CHROMA_PATH=data/chroma, exactly
+    # what backend/env.example documents) is just a plain string and is
+    # otherwise resolved against the process's *current working directory*
+    # wherever Path(settings.chroma_path) is eventually opened. That is
+    # fine when the process starts from the repo root (Render's
+    # `--app-dir backend` only affects the Python import path, not the
+    # CWD) but silently wrong when it starts from inside backend/ (as
+    # scripts/run.sh does: `cd backend && exec uvicorn ...`) — a relative
+    # CHROMA_PATH then resolves to backend/data/chroma, an empty directory
+    # distinct from the real index, and every query abstains at 0%
+    # confidence forever with no error raised anywhere. Anchoring every
+    # relative override to REPO_ROOT here makes the setting mean the same
+    # thing regardless of where the process happens to be started from.
+    @field_validator(
+        "chroma_path",
+        "corpus_manifest_path",
+        "pdf_dir",
+        "sqlite_registry_path",
+        "audit_db_path",
+        "updates_sources_path",
+        "updates_watcher_db_path",
+        "updates_queue_db_path",
+        "updates_stage_dir",
+        "patent_cases_db_path",
+        mode="after",
+    )
+    @classmethod
+    def _anchor_to_repo_root(cls, value: str) -> str:
+        path = Path(value)
+        return str(path) if path.is_absolute() else str(REPO_ROOT / path)
+
+    @property
+    def normalized_cors_origins(self) -> list[str]:
+        return [x.strip() for x in self.cors_origins if x.strip()]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
+settings.cors_origins = settings.normalized_cors_origins
