@@ -144,7 +144,7 @@ loud failure in a system whose entire value is citation accuracy. Run
 
 ## Embeddings
 
-Default `BAAI/bge-small-en-v1.5` (384-dim, CPU-friendly). Documents are
+The default deployment backend is the fitted TF-IDF index. Optional `BAAI/bge-small-en-v1.5` (384-dim, CPU-friendly) is available when model weights are enabled. Documents are
 encoded with the `passage: ` prefix; **the retrieval service must use
 `query: ` and the same model**, or the vectors are meaningless.
 

@@ -135,8 +135,9 @@ class TfidfEmbedder:
     raising anything — so `encode`/`encode_query` refuse to run unfitted
     rather than let that happen.
 
-    Not the shipping default. `SentenceTransformerEmbedder` remains that;
-    this is what you reach for when the weights are genuinely unreachable.
+    This is the default deployment backend in the repository. The neural
+    SentenceTransformer backend remains available when model weights are
+    deliberately enabled and the index is rebuilt in that vector space.
     """
 
     #: Where the fitted vectorizer is persisted, relative to the Chroma dir.

@@ -4,7 +4,7 @@ import {
   RESOURCE_ORIGINS, CULTIVATION, SCOPES,
 } from '../lib/api.js';
 import { Link } from 'react-router-dom';
-import { useCorpus, useScope, useLang } from '../App.jsx';
+import { useCorpus, useScope } from '../App.jsx';
 import {
   Send, Search, Chevron, Alert, Info, Check, Clock, Globe, Scale, Pin,
 } from '../components/Icons.jsx';
@@ -29,7 +29,6 @@ export default function Ask() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const { scope, setScope } = useScope();
-  const { lang } = useLang();
   const { corpus } = useCorpus();
   const resultRef = useRef(null);
   const taRef = useRef(null);
@@ -71,10 +70,9 @@ export default function Ask() {
         // classification carries only what the facts panel supplies.
         classification: { formulation_type },
         complianceFacts,
-        // From the header picker. Null means "detect it from the query
-        // text" — the backend's script heuristic is the fallback, not the
-        // only path, because it cannot tell Hindi from Marathi.
-        language: lang,
+        // No UI language picker: let the backend detect the language from
+        // the query text and translate through Bhashini when configured.
+        language: null,
         signal: ctrl.signal,
       });
       setResult({ data, query });

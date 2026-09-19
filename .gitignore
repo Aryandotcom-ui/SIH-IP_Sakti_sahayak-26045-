@@ -27,3 +27,4 @@ __pycache__/
 
 # Local Python virtualenv.
 /.venv/
+/backend/.venv/

@@ -102,7 +102,7 @@ def test_status_reports_the_active_embedder_not_the_configured_one(monkeypatch):
         def status(self):
             return {
                 "collection": "ip_sakti_corpus", "chunks": 40, "index_ready": True,
-                "configured_embedding_model": "BAAI/bge-small-en-v1.5",
+                "configured_embedding_model": "tfidf",
                 "active_embedding_model": "tfidf-384",
                 "embedding_dimension": 384, "embedding_is_fallback": True,
                 "generation_mode": "mock", "llm_model": None,
@@ -112,7 +112,7 @@ def test_status_reports_the_active_embedder_not_the_configured_one(monkeypatch):
 
     monkeypatch.setattr(insight_routes, "ai_service", FakeService())
     body = client.get("/api/v1/status").json()
-    assert body["configured_embedding_model"] == "BAAI/bge-small-en-v1.5"
+    assert body["configured_embedding_model"] == "tfidf"
     assert body["active_embedding_model"] == "tfidf-384"
     assert body["embedding_is_fallback"] is True
 

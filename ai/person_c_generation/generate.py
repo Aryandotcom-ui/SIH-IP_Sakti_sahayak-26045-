@@ -177,6 +177,17 @@ def call_llm(
     retrieval -> prompt -> LLM -> JSON parsing -> FinalAnswer.
     """
 
+    api_key = api_key or os.environ.get("GROQ_API_KEY")
+
+    # Fail on the required configuration first. This keeps the missing-key
+    # path deterministic even when the optional OpenAI-compatible client is
+    # not installed (for example in a lightweight test environment).
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set. "
+            "Add it to your .env file or pass api_key explicitly."
+        )
+
     try:
         from openai import OpenAI
     except ImportError as e:
@@ -184,14 +195,6 @@ def call_llm(
             "The 'openai' package is required for Groq API calls. "
             "Install it with: pip install openai"
         ) from e
-
-    api_key = api_key or os.environ.get("GROQ_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "GROQ_API_KEY is not set. "
-            "Add it to your .env file or pass api_key explicitly."
-        )
 
     client = OpenAI(
         api_key=api_key,

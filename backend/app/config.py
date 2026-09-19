@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # Resolve the default corpus relative to the repository, not the process cwd.
     chroma_path: str = str(REPO_ROOT / "data" / "chroma")
     chroma_collection: str = "ip_sakti_corpus"
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_model: str = "tfidf"
     embedding_device: str | None = "cpu"
     top_k: int = 5
     abstain_threshold: float = 0.20
@@ -75,13 +75,10 @@ class Settings(BaseSettings):
 
     # Formalizes the existing mock/live generation fallback (see
     # AIService._answer_for_scope). True (default) keeps today's
-    # behaviour: no GROQ_API_KEY -> deterministic mock prose, clearly
-    # labelled generation="mock" in the response. Setting this False in a
-    # production deployment that expects live generation makes a missing
-    # key a hard "generation unavailable" failure instead of a silent
-    # demo fallback, so an operator cannot accidentally ship demo prose
-    # believing it is live.
-    demo_mode: bool = True
+    # behaviour: no GROQ_API_KEY -> generation is unavailable by default.
+    # Set DEMO_MODE=true explicitly only for development/testing to enable
+    # the deterministic mock fallback.
+    demo_mode: bool = False
 
     # Kept for future Claude support.
     anthropic_api_key: str | None = None

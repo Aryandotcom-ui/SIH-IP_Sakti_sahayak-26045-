@@ -3,6 +3,10 @@
 Multilingual, citation-grounded AI assistant for Ayurvedic intellectual
 property and regulatory guidance.
 
+## Smart India Hackathon Problem Statement
+
+> **IP-SAKTI Sahayak a multilingual, RAG-based (source-cited) AI assistant for Intellectual Property and regulatory guidance in Ayurveda, across national and international regimes.**
+
 Ask a question in plain language and get an answer that names the sections
 it rests on, shows you their verbatim text, and screens your facts against
 the access-and-benefit-sharing duties that Ayurvedic IP filings trigger —
@@ -34,20 +38,19 @@ Other options:
 ./scripts/run.sh --rebuild    # discard and rebuild the search index
 ```
 
-### Generated answer wording is off by default
+### Generated answer wording requires a Groq API key
 
-Set `GROQ_API_KEY` to have a model write the prose:
+Set `GROQ_API_KEY` to enable live answer generation:
 
 ```bash
 export GROQ_API_KEY=gsk_...
 ./scripts/run.sh
 ```
 
-Without it the wording comes from a deterministic stand-in and every answer
-is labelled **"Canned prose — no API key"** in the UI. Retrieval, citations,
-confidence, deadlines and compliance screening are real either way; only the
-sentence phrasing is affected. Passing canned text off as a generated answer
-is the failure this project exists to prevent, so the label is not optional.
+Without a key, `DEMO_MODE` is **off by default** and the generation step is
+reported as unavailable rather than returning canned prose. Retrieval,
+citations, evidence scoring and compliance screening remain real; only the
+LLM wording step is unavailable.
 
 ## Deploying it
 
@@ -124,7 +127,7 @@ International scope, or Both."
 | `ai/translation.py` | Bhashini translation; retrieval always runs on English. The source language is auto-detected from the query script — there is no language picker in the UI |
 | `backend/` | FastAPI service over the above |
 | `frontend/` | React web UI (Vite), proxied to the API in development |
-| `data/pdfs/` | The 17-document legal corpus (statutes, rules, treaties, guidelines) |
+| `data/pdfs/` | The physical legal corpus: 32 PDFs currently present, represented by a 34-document manifest with 27 ingested and 7 pending entries |
 
 The search index (`data/chroma/`) is **not** in version control. It is
 derived from `data/pdfs` and rebuilds in about a minute, so it is generated
@@ -185,9 +188,11 @@ Ten points, in the order a question travels through the system.
    the reader, so collapsing them into one "I don't know" would be the
    easy thing and the wrong one.
 
-5. **BGE and TF-IDF.** `BAAI/bge-small-en-v1.5` is the default embedder
-   and the one to ship. Character-ngram TF-IDF is the offline fallback
-   for a machine that cannot download model weights: it matches wording
+5. **TF-IDF and BGE.** The repository's local and Render deployment path
+   uses the fitted character-ngram TF-IDF embedder by default. `BAAI/bge-small-en-v1.5`
+   remains the optional neural embedder when model weights are available;
+   switching to it requires a full index rebuild because queries and chunks
+   must share the same vector space. TF-IDF matches wording
    rather than meaning, so a question phrased far from the statute's
    language can retrieve the wrong Act, and it sets `CALIBRATED = False`
    so the interface says its scores are not meaningful rather than
@@ -206,13 +211,10 @@ Ten points, in the order a question travels through the system.
    number is the single most damaging output this system could produce,
    because it looks exactly like a real one.
 
-7. **Demo fallback.** Without a key, `DEMO_MODE` produces deterministic
-   canned prose and the interface says so on the answer itself, in
-   words. The retrieved sections, citations and compliance screening
-   around it are still real. With `DEMO_MODE=false` and no key,
-   generation reports `unavailable` — meaning no prose was produced at
-   all, which is a different fact from `none` (the system abstained) and
-   is reported as such.
+7. **Generation safety.** `DEMO_MODE` is off by default. Without a key,
+   generation reports `unavailable` — meaning no prose was produced at all.
+   Retrieval, citations, evidence and compliance screening remain available.
+   Demo mode can still be enabled explicitly for development/testing.
 
 8. **Bhashini translation.** Non-English queries are translated to
    English before retrieval — not as a UX nicety, but because the
@@ -228,11 +230,10 @@ Ten points, in the order a question travels through the system.
    reader who asked for Hindi and is looking at English depends entirely
    on that flag being honest.
 
-9. **Language selection.** English plus all 22 scheduled languages, in a
-   searchable dropdown. Leaving it on English does not force English —
-   the backend still detects the script of the incoming query. Choosing
-   explicitly only removes the guess, which matters because detection is
-   a Unicode-script heuristic and cannot tell Hindi from Marathi.
+9. **Language detection and translation.** The UI does not expose a language
+   selector. The backend detects the language from the query when no explicit
+   language is supplied, and Bhashini translation is used when its credentials
+   are configured.
 
 10. **Jurisdiction selection.** India, international, or both. "Both" is
     two separately filtered retrievals and two separate generation
@@ -248,13 +249,15 @@ These are real and worth knowing before you rely on anything here.
 - **Nothing here is legal advice.** Every obligation must be checked
   against the bare text of the cited provision and with a registered
   patent agent.
-- **13 of the 17 corpus documents have no `source_url`**, so their
-  citations cannot link out to official text. They are fully ingested
-  and quoted verbatim; there is just no verified URL on file.
-- **The offline TF-IDF embedder is lexical, not semantic** — see point 5
-  above. If the deployment is running on it, retrieval quality is
-  materially worse than the shipping configuration and the interface
-  labels its scores uncalibrated.
+- **26 of the 34 manifest documents have no `source_url`**, so their
+  provenance is recorded in the manifest's `acquisition` block instead.
+  The manifest currently contains 27 `ingested` entries and 7 `pending`
+  entries; two pending entries have no corresponding PDF in the repository.
+
+- **The default TF-IDF embedder is lexical rather than neural-semantic** —
+  see point 5 above. Its scores are explicitly treated as uncalibrated.
+  The optional BGE backend provides neural embeddings when model weights
+  are deliberately enabled and the index is rebuilt.
 - **There is no cross-encoder rerank stage.** Ranking errors are mostly
   a neighbouring provision of the right Act outranking the governing
   one, so read the passages on the Evidence view rather than trusting

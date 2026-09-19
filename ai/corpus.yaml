@@ -508,18 +508,6 @@ documents:
         registration and related requirements.
       priority: low
 
-    status: pending
-    jurisdiction: international
-    instrument_type: treaty
-    act_name: "Agreement on Trade-Related Aspects of Intellectual Property Rights"
-    source_url: ""
-    acquisition:
-      where: "WTO (wto.org/english/docs_e/legal_e)"
-      note: >-
-        Article 27(3)(b) is the hook the Patents Act's section 3(p)
-        exclusions sit against, and Article 29 the disclosure duty. The most
-        load-bearing international instrument still missing.
-      priority: high
 
   - file: convention-on-biological-diversity-1992.pdf
     status: pending

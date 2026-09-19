@@ -10,7 +10,7 @@ import About from './pages/About.jsx';
 import Login from './pages/Login.jsx';
 import Review from './pages/Review.jsx';
 import { Leaf, Sun, Moon } from './components/Icons.jsx';
-import { ScopeToggle, LanguageDropdown } from './components/Bits.jsx';
+import { ScopeToggle } from './components/Bits.jsx';
 import { api, auth, DEFAULT_SCOPE } from './lib/api.js';
 
 /* The public nav mirrors how someone actually moves through the product:
@@ -39,11 +39,6 @@ export const useCorpus = () => useContext(CorpusCtx);
    than in the Ask page so it survives navigating away and back. */
 const ScopeCtx = createContext({ scope: DEFAULT_SCOPE, setScope: () => {} });
 export const useScope = () => useContext(ScopeCtx);
-
-/* The answer language, same reasoning. `null` means "detect it from the
-   query text" — see LANGUAGE_CATALOG in lib/languages.js. */
-const LangCtx = createContext({ lang: null, setLang: () => {} });
-export const useLang = () => useContext(LangCtx);
 
 /* Who is signed in, if anyone. Anonymous is the normal state: the whole
    public product works without an account, and only the reviewer console
@@ -108,7 +103,6 @@ function useIdentity() {
 export default function App() {
   const [theme, setTheme] = useTheme();
   const [scope, setScope] = useSessionState('ipsakti-scope', DEFAULT_SCOPE);
-  const [lang, setLang] = useSessionState('ipsakti-lang', null);
   const [corpus, setCorpus] = useState(null);
   const [corpusError, setCorpusError] = useState(null);
   const session = useIdentity();
@@ -136,8 +130,7 @@ export default function App() {
   return (
     <CorpusCtx.Provider value={{ corpus, error: corpusError, reload: () => loadCorpus() }}>
       <ScopeCtx.Provider value={{ scope, setScope }}>
-        <LangCtx.Provider value={{ lang, setLang }}>
-          <AuthCtx.Provider value={session}>
+        <AuthCtx.Provider value={session}>
             <div className="app">
               <header className="topbar">
                 <div className="shell topbar-inner">
@@ -166,7 +159,6 @@ export default function App() {
                       counts={corpus?.jurisdictions}
                       compact
                     />
-                    <LanguageDropdown value={lang} onChange={setLang} />
                   </div>
 
                   <button
@@ -192,7 +184,6 @@ export default function App() {
                     is a jurisdiction they will not notice is wrong. */}
                 <div className="topbar-controls-mobile">
                   <ScopeToggle value={scope} onChange={setScope} counts={corpus?.jurisdictions} compact />
-                  <LanguageDropdown value={lang} onChange={setLang} />
                 </div>
               </header>
 
@@ -220,7 +211,6 @@ export default function App() {
               </footer>
             </div>
           </AuthCtx.Provider>
-        </LangCtx.Provider>
       </ScopeCtx.Provider>
     </CorpusCtx.Provider>
   );
