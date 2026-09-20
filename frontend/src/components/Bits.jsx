@@ -167,6 +167,11 @@ const GENERATION_COPY = {
     label: 'No generation run',
     help: 'The system abstained before generating, so no model was called. This is the intended behaviour when the evidence does not support an answer.',
   },
+  failed: {
+    tone: 'warn',
+    label: 'Answer wording failed',
+    help: 'A generation backend is configured but this request to it failed, so no prose was produced for this query. The citations and retrieved passages below are real retrieval output and are unaffected. This is a transient backend problem, not a limit of the corpus — retrying may work.',
+  },
 };
 
 export function GenerationStatus({ generation, provider }) {

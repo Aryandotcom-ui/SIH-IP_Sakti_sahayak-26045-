@@ -418,7 +418,12 @@ function Obligation({ o }) {
           {o.authority && <span className="faint">Authority · {o.authority}</span>}
           {o.deadline && <span className="faint">Due · {o.deadline}</span>}
           {o.form && <span className="faint">Form · {o.form}</span>}
-          {o.review_status && o.review_status !== 'reviewed' && (
+          {/* Both vocabularies are in the corpus: ontology.yaml writes
+              `draft` for an unsigned-off obligation, deadlines.yaml writes
+              `verified` for a checked one. Testing only for 'reviewed'
+              badged a verified rule as though it were provisional, which
+              is the one direction this badge must never get wrong. */}
+          {o.review_status && !['reviewed', 'verified'].includes(o.review_status) && (
             <Badge tone="neutral">{o.review_status}</Badge>
           )}
         </div>

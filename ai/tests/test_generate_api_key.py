@@ -18,9 +18,15 @@ def _fake_openai_module(captured: dict):
     module = MagicMock()
 
     class FakeClient:
-        def __init__(self, api_key, base_url):
+        # **options rather than a fixed signature: these tests are about
+        # which credential and endpoint the call is routed to, and a fake
+        # that breaks when an unrelated transport option (a timeout, a
+        # retry count) is added is testing the constructor's spelling
+        # rather than the behaviour it was written for.
+        def __init__(self, api_key, base_url, **options):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
+            captured["options"] = options
 
             self.chat = MagicMock()
 
@@ -88,3 +94,24 @@ def test_call_llm_requires_groq_api_key(monkeypatch):
         match="GROQ_API_KEY",
     ):
         call_llm("test prompt")
+
+
+def test_call_llm_bounds_the_request_timeout(monkeypatch):
+    """A generation call must not be allowed to hang indefinitely.
+
+    The client library's default read timeout is ten minutes. Nothing
+    upstream waits that long — the browser gives up at 60s — so an
+    unbounded call holds a worker thread open long after the only reader
+    has gone, and a demo under load runs out of workers rather than
+    returning the degraded answer it is designed to return.
+    """
+    captured = {}
+
+    monkeypatch.setitem(sys.modules, "openai", _fake_openai_module(captured))
+    monkeypatch.setenv("GROQ_API_KEY", "environment-groq-key")
+
+    call_llm("test prompt")
+
+    timeout = captured["options"].get("timeout")
+    assert timeout is not None, "no timeout passed: the call can hang for the library default"
+    assert timeout <= 60, f"timeout {timeout}s outlives the client that is waiting for it"

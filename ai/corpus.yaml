@@ -470,7 +470,7 @@ documents:
       priority: low
 
   - file: designs-rules-2001.pdf
-    status: ingested
+    status: pending
     jurisdiction: india
     instrument_type: rule
     act_name: "The Designs Rules, 2001"
@@ -479,7 +479,14 @@ documents:
       where: "Indian Patent Office (ipindia.gov.in)"
       note: >-
         Rules governing applications, registration and procedural requirements
-        under the Designs Act, 2000.
+        under the Designs Act, 2000. The copy previously held here was a
+        page-image scan with no text layer at all (43/43 pages), so it
+        produced zero chunks and failed every ingest run. It is listed as
+        pending rather than ingested because that is the truth: the rules
+        exist and are cited, and we do not currently hold a readable copy.
+        Replace with a text-layer PDF, or OCR the scan (ocrmypdf) and check
+        that section numbers survive before flipping this back to ingested —
+        a mis-numbered rule cites worse than an absent one.
       priority: medium
 
   - file: drugs-and-magic-remedies-act-1954.pdf
@@ -510,7 +517,7 @@ documents:
 
 
   - file: convention-on-biological-diversity-1992.pdf
-    status: pending
+    status: ingested
     jurisdiction: international
     instrument_type: treaty
     act_name: "Convention on Biological Diversity, 1992"
@@ -524,7 +531,7 @@ documents:
       priority: high
 
   - file: madrid-protocol-1989.pdf
-    status: pending
+    status: ingested
     jurisdiction: international
     instrument_type: treaty
     act_name: "Protocol Relating to the Madrid Agreement Concerning the International Registration of Marks"
@@ -535,7 +542,7 @@ documents:
       priority: low
 
   - file: hague-agreement-1999.pdf
-    status: pending
+    status: ingested
     jurisdiction: international
     instrument_type: treaty
     act_name: "Hague Agreement Concerning the International Registration of Industrial Designs"
@@ -546,7 +553,7 @@ documents:
       priority: low
 
   - file: budapest-treaty-1977.pdf
-    status: pending
+    status: ingested
     jurisdiction: international
     instrument_type: treaty
     act_name: "Budapest Treaty on the International Recognition of the Deposit of Microorganisms for the Purposes of Patent Procedure"
@@ -560,7 +567,7 @@ documents:
       priority: medium
 
   - file: eu-directive-2004-24-ec-thmpd.pdf
-    status: pending
+    status: ingested
     jurisdiction: international
     instrument_type: statute
     act_name: "Directive 2004/24/EC on Traditional Herbal Medicinal Products"

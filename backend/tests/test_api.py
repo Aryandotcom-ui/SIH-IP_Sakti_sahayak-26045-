@@ -30,9 +30,32 @@ def auth_headers(role: str = "REVIEWER", username: str = "test-reviewer") -> dic
 
 
 def test_health():
+    """/health must report honestly, and the report must be internally
+    consistent.
+
+    Asserting a flat "ok" made this test depend on something the repository
+    does not carry: data/chroma is a build artifact, so on a fresh clone
+    the index is empty and "degraded" is the CORRECT answer. The assertion
+    that matters is not which word comes back, it is that the word agrees
+    with the component flags beside it — a service reporting "ok" while
+    saying its index is not ready is the actual bug here.
+    """
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    body = response.json()
+    assert body["status"] in {"ok", "degraded", "down"}
+
+    # "down" and "degraded" cannot be told apart from the payload alone (an
+    # unreachable corpus and an empty one both report retrieval_ready
+    # false), so the check runs both directions of the one implication that
+    # holds either way: "ok" iff every dependency is ready.
+    everything_ready = (
+        body["index_ready"] and body["retrieval_ready"] and body["generation_ready"]
+    )
+    if body["status"] == "ok":
+        assert everything_ready, f"reported ok with a dependency down: {body}"
+    else:
+        assert not everything_ready, f"reported {body['status']} with everything ready: {body}"
 
 
 def test_query_validation():
@@ -651,6 +674,18 @@ def test_empty_scope_retrieval_names_the_other_scope_instead_of_guessing(monkeyp
             from ai.person_b_retrieval.schema import RetrievalResult
             return RetrievalResult(query=query, matched_chunks=[],
                                    confidence=0.0, should_abstain=True), {}
+
+        # A populated, correctly tagged corpus that simply holds nothing
+        # relevant to THIS query — which is the case under test. Left to
+        # the real index, both of these read empty on a fresh clone
+        # (data/chroma is a build artifact, not version-controlled) and
+        # the service correctly answers "the index has not been built"
+        # instead, which is a different message about a different problem.
+        def corpus_count(self) -> int:
+            return 3000
+
+        def corpus_jurisdictions(self) -> dict[str, int]:
+            return {"india": 2000, "international": 1000}
 
     monkeypatch.setattr(service_module, "generate_answer", exploding_generate_answer)
     result = FakeService().answer("budapest treaty deposit", None, 1, scope="IN")

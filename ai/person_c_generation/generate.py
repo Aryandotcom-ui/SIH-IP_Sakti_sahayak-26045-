@@ -199,6 +199,12 @@ def call_llm(
     client = OpenAI(
         api_key=api_key,
         base_url="https://api.groq.com/openai/v1",
+        # The SDK's default read timeout is ten minutes. Nothing upstream
+        # waits that long — the browser client gives up at 60s — so without
+        # a bound here a stalled call holds a worker thread open long after
+        # the only reader has gone.
+        timeout=45.0,
+        max_retries=2,
     )
 
     response = client.chat.completions.create(
@@ -209,7 +215,14 @@ def call_llm(
                 "content": prompt,
             }
         ],
-        max_tokens=1024,
+        # The model answers in a JSON envelope, so a ceiling low enough to
+        # cut a long answer short does not truncate the prose — it truncates
+        # the JSON, and parse_llm_response raises rather than guessing at
+        # what the closing brace would have contained. A statutory answer
+        # carrying several citations and their reasoning runs past 1024
+        # comfortably, and the failure it caused looked like a backend
+        # outage rather than a budget.
+        max_tokens=2048,
         temperature=0,
     )
 

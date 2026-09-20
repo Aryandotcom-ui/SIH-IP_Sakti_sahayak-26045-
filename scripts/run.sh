@@ -97,13 +97,26 @@ CHUNKS=$(curl -sf http://127.0.0.1:8000/api/v1/corpus \
          | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["chunks"])' 2>/dev/null || echo 0)
 say "API is up — $CHUNKS chunks indexed"
 
-if [ -z "${GROQ_API_KEY:-}" ]; then
+if [ -z "${GROQ_API_KEY:-}" ] && [ "${DEMO_MODE:-}" != "true" ]; then
   cat <<'NOTE'
 
-  Note: GROQ_API_KEY is not set, so the answer wording comes from a
-  deterministic stand-in and the UI labels it "Canned prose - no API key".
-  Retrieval, citations, deadlines and compliance screening are real either
-  way. Export the key and restart to generate the wording for real.
+  Note: GROQ_API_KEY is not set and DEMO_MODE is off, so no answer prose is
+  produced at all and the UI labels every answer "No answer generated".
+  Retrieval, citations, deadlines and compliance screening are real and
+  still work. Two ways forward:
+
+    export GROQ_API_KEY=gsk_...   generate the wording for real
+    export DEMO_MODE=true         deterministic stand-in prose, labelled
+                                  "Canned prose - no API key" in the UI
+
+NOTE
+elif [ -z "${GROQ_API_KEY:-}" ]; then
+  cat <<'NOTE'
+
+  Note: GROQ_API_KEY is not set and DEMO_MODE is on, so the answer wording
+  comes from a deterministic stand-in and the UI labels it "Canned prose -
+  no API key". Retrieval, citations, deadlines and compliance screening are
+  real either way. Export the key and restart to generate for real.
 
 NOTE
 fi

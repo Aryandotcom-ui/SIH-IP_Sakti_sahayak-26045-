@@ -139,3 +139,37 @@ def test_never_reports_live_without_a_key(service, monkeypatch):
         result = service.answer(IN_DOMAIN_QUERY, Classification(), top_k=5, scope="IN")
         assert result["generation"] != "live"
         assert result["generation_provider"] != "groq"
+
+
+def test_case_d_generation_failure_degrades_instead_of_failing_the_request(service, monkeypatch):
+    """A key is configured but the call raises -> "failed", and the rest of
+    the answer survives.
+
+    The wording step is the only part of a response that depends on a third
+    party, and the third party here is a free API tier. A rate limit, a
+    retired model id, a network blip or an answer long enough to truncate
+    its own JSON envelope must not discard the retrieval, citations,
+    verbatim passages and compliance screening that were already computed
+    — letting the exception escape turns a partial success into a 500 and
+    shows the reader nothing at all.
+    """
+    monkeypatch.setattr(settings, "groq_api_key", "fake-test-key")
+
+    def exploding_call_llm(prompt, model, api_key=None):
+        raise RuntimeError("rate limit exceeded")
+
+    monkeypatch.setattr("ai.person_c_generation.generate.call_llm", exploding_call_llm)
+
+    result = service.answer(IN_DOMAIN_QUERY, Classification(), top_k=5, scope="IN")
+
+    assert result["generation"] == "failed"
+    # Nothing produced prose, so nothing may be credited with having done so.
+    assert result["generation_provider"] is None
+    assert result["abstained"] is True
+    # The part that did work is still in the response and is what the
+    # reader is pointed at.
+    assert result["sources"], "retrieved sources were discarded on a generation failure"
+    assert "retrieved" in result["answer_text"].lower()
+    # A failed backend is not the same claim as an unconfigured one: the
+    # fixes differ, and a reader told the wrong one debugs the wrong thing.
+    assert "not configured" not in result["answer_text"].lower()

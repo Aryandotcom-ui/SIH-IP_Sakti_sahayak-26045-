@@ -8,10 +8,14 @@
 # Without it the site falls back to a same-origin /api/v1 that does not
 # exist here, and every page shows the sample-data banner.
 
+# `publish` is resolved RELATIVE TO `base`, not to the repository root.
+# Spelling it "frontend/dist" here resolves to frontend/frontend/dist, which
+# does not exist, and the deploy fails after a build that succeeded — the
+# confusing order of events that makes this worth a comment.
 [build]
   base    = "frontend"
   command = "npm ci && npm run build"
-  publish = "frontend/dist"
+  publish = "dist"
 
 [build.environment]
   NODE_VERSION = "20"

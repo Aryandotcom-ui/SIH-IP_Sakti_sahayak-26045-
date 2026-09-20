@@ -127,7 +127,7 @@ International scope, or Both."
 | `ai/translation.py` | Bhashini translation; retrieval always runs on English. The source language is auto-detected from the query script — there is no language picker in the UI |
 | `backend/` | FastAPI service over the above |
 | `frontend/` | React web UI (Vite), proxied to the API in development |
-| `data/pdfs/` | The physical legal corpus: 32 PDFs currently present, represented by a 34-document manifest with 27 ingested and 7 pending entries |
+| `data/pdfs/` | The physical legal corpus: 31 PDFs currently present, represented by a 34-document manifest with 31 ingested and 3 pending entries |
 
 The search index (`data/chroma/`) is **not** in version control. It is
 derived from `data/pdfs` and rebuilds in about a minute, so it is generated
@@ -249,10 +249,18 @@ These are real and worth knowing before you rely on anything here.
 - **Nothing here is legal advice.** Every obligation must be checked
   against the bare text of the cited provision and with a registered
   patent agent.
-- **26 of the 34 manifest documents have no `source_url`**, so their
+- **25 of the 34 manifest documents have no `source_url`**, so their
   provenance is recorded in the manifest's `acquisition` block instead.
-  The manifest currently contains 27 `ingested` entries and 7 `pending`
-  entries; two pending entries have no corresponding PDF in the repository.
+  The manifest contains 31 `ingested` entries and 3 `pending` ones, and
+  those two sets now match the filesystem exactly: every ingested entry
+  has its PDF and no pending entry does.
+- **Three instruments are cited but not held.** The Patents (Amendment)
+  Rules, 2024 and the FDA botanical-drug guidance have never been
+  acquired; the Designs Rules, 2001 copy was a page-image scan with no
+  text layer, so it produced nothing and has been removed rather than
+  left to fail every ingest. The 2024 patent rules are the consequential
+  gap: three deadlines in `ai/patent_prep/deadlines.yaml` carry
+  `review_status: draft` precisely because that text is missing.
 
 - **The default TF-IDF embedder is lexical rather than neural-semantic** —
   see point 5 above. Its scores are explicitly treated as uncalibrated.

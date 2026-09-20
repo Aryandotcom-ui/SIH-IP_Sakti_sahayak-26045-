@@ -723,14 +723,49 @@ class AIService:
                 insufficient = True
             else:
                 use_mock = not settings.groq_api_key
-                final = generate_answer(
-                    retrieval,
-                    model=settings.llm_model,
-                    mock=use_mock,
-                    api_key=settings.groq_api_key,
-                    jurisdiction_label=label,
-                )
-                generation_mode = "mock" if use_mock else "live"
+                try:
+                    final = generate_answer(
+                        retrieval,
+                        model=settings.llm_model,
+                        mock=use_mock,
+                        api_key=settings.groq_api_key,
+                        jurisdiction_label=label,
+                    )
+                    generation_mode = "mock" if use_mock else "live"
+                except Exception:
+                    # The wording step is the only part of this response that
+                    # depends on a third party. Retrieval, the citations, the
+                    # verbatim passages and the compliance screening are all
+                    # already computed by this point, so letting the exception
+                    # reach the route handler turns a partial success into a
+                    # 500 and throws away everything that did work.
+                    #
+                    # The failures this catches are not exotic: a rate limit
+                    # on a free API tier, a decommissioned model id, a network
+                    # blip, or an answer long enough that the JSON envelope
+                    # hits max_tokens and truncates mid-object, which
+                    # parse_llm_response cannot parse and will not guess at.
+                    #
+                    # Reported as its own mode rather than folded into
+                    # "unavailable": no key configured and a key that failed
+                    # are different problems with different fixes, and a
+                    # reader who is told the wrong one debugs the wrong thing.
+                    log.exception("answer generation failed; serving retrieval only")
+                    from ai.shared.schema import FinalAnswer
+
+                    final = FinalAnswer(
+                        answer_text=(
+                            "The answer-wording step failed for this query, so "
+                            "there is no generated prose below. The retrieved "
+                            "sections and their verbatim text are real and "
+                            "unaffected — read those. Retrying may work."
+                        ),
+                        citations=[],
+                        confidence=retrieval.confidence,
+                        abstained=True,
+                        disclaimer="This is informational, not legal advice.",
+                    )
+                    generation_mode = "failed"
 
         # Keep source metadata from retrieval for the UI. Generation uses
         # the existing Shape-3/Shape-4 contract and therefore does not
@@ -1137,6 +1172,15 @@ class AIService:
                 # kind of ambiguity the generation-state contract exists
                 # to prevent.
                 else "unavailable" if "unavailable" in modes
+                # Same reasoning one step further: a part that tried to
+                # generate and got an error back is not a part that never
+                # tried. "failed" outranks "none" because it is the only
+                # one of the two a reader can act on — retrying a failed
+                # backend sometimes works, retrying an abstention never
+                # does — and because a scope-BOTH query where one side
+                # abstained and the other errored would otherwise report
+                # the error as though nothing had gone wrong.
+                else "failed" if "failed" in modes
                 else "none"
             )
             withheld = sorted({
@@ -1202,12 +1246,18 @@ class AIService:
                 "audit_id": audit_id,
                 # "live" (a real model call), "mock" (no API key configured —
                 # the prose is canned, the citations and screening are not),
-                # or "none" (abstained, so no generation happened).
+                # "unavailable" (no key and no demo fallback, so nothing was
+                # produced), "failed" (a backend was called and errored, so
+                # the retrieval half of this response is all there is), or
+                # "none" (abstained, so no generation was attempted).
                 "generation": generation,
                 # "groq" only when generation actually ran live; "demo" for
                 # the deterministic mock fallback (still a "provider" in the
                 # sense that something produced the prose, just not an
-                # LLM); None when nothing generated anything at all.
+                # LLM); None when nothing generated anything at all —
+                # which covers "unavailable" (no key), "none" (abstained
+                # before generating) and "failed" (the backend was called
+                # and did not come back with usable output).
                 "generation_provider": {
                     "live": "groq", "mock": "demo", "none": None,
                 }.get(generation, None),
