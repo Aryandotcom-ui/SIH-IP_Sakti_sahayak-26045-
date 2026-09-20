@@ -12,6 +12,70 @@ it rests on, shows you their verbatim text, and screens your facts against
 the access-and-benefit-sharing duties that Ayurvedic IP filings trigger —
 the ones applicants usually do not know to ask about.
 
+## What runs today
+
+Working end to end, in this repository, today:
+
+| | |
+|---|---|
+| **Corpus** | 3,300 chunks from 31 statutes, rules and treaties — Patents, GI, Trade Marks, Designs, Copyright, PPVFR, Biological Diversity (2002 + 2023 amendment + 2024 Rules), Drugs & Cosmetics, Drugs & Magic Remedies, FSSAI Ayurveda Aahar, Cosmetics Rules; TRIPS, CBD, Nagoya, WIPO GRATK 2024, PCT, Paris, Madrid, Hague, Budapest, EU THMPD |
+| **Jurisdiction separation** | India / International / Both, filtered at the index before ranking. "Both" is two retrievals and two generations rendered as two labelled blocks — never one merged ranking |
+| **Formulation routing** | All six regulatory categories (classical, proprietary, new drug, phytopharmaceutical, Ayurveda Aahar, cosmetic) mapped through a regulatory graph to the regimes that govern them |
+| **ABS compliance engine** | 14 obligations with legal basis, triggering conditions, defeating exemptions, authority, form and deadline — rule-driven, so it answers where retrieval cannot |
+| **Citation verification** | Every citation a model returns is checked against an actually-retrieved `(act_name, section)` pair and dropped if it was invented |
+| **Abstention** | Three distinct refusals — out of domain, ambiguous intent, insufficient evidence — each with its own next step for the reader |
+| **Audit & consent** | Per-query audit trail, per-act consent gating for licensed sources, retention bound, JWT + bcrypt role gating on the reviewer console |
+| **Tests** | 354 passing, green both with and without a prebuilt index; CI runs corpus-integrity, index build, the suite and the frontend build |
+
+### Measured results
+
+Both figures come from the same runner over the same 37-question set
+(`ai/person_c_generation/eval/`), and both are reproducible:
+
+```
+$ python -m ai.person_c_generation.eval.eval_runner
+
+generation: 37/37 passed  (100.0%)
+
+  category                   passed
+  abs                      7/7   100.0%
+  gi                       1/1   100.0%
+  jurisdiction_intl        4/4   100.0%
+  labelling                2/2   100.0%
+  patentability            8/8   100.0%
+  temporal                 2/2   100.0%
+  tk                       3/3   100.0%
+  unanswerable            10/10  100.0%
+```
+
+That is the **generation contract**: given the right passages, does the
+answer cite the provision it should, and does it abstain when handed
+nothing to work with? 37/37, including all ten deliberately unanswerable
+questions. It is not a claim about search quality, because the passages
+are supplied by the fixtures.
+
+Search quality is the second number, and it is the honest one to read
+next — same runner, `--retrieval`, against the real index:
+
+```
+$ python -m ai.person_c_generation.eval.eval_runner --retrieval
+
+Recall@5                    12/17   70.6%
+abstention accuracy         17/22   77.3%
+  correctly abstained       0/5    0.0%
+  correctly answered        17/17  100.0%
+```
+
+Recall@5 of 70.6% means the governing provision reached the top five for
+12 of 17 answerable questions. The 0/5 is the one that matters and we are
+not going to dress it up: with the offline TF-IDF backend and the shipped
+abstention threshold, five out-of-scope questions ("what is the GST rate
+on Ayurvedic medicines?") got answered instead of refused. Both numbers
+are a property of the lexical fallback embedder described in **Known
+limitations** below, not of the pipeline around it — the same eval is the
+instrument for showing that, which is why it is published rather than
+summarised.
+
 ## Run it
 
 You need Python 3.11+, Node 18+, and this repository. One command:
@@ -136,8 +200,14 @@ rather than versioned.
 ## Tests
 
 ```bash
-python3 -m pytest -q
+python3 -m pytest -q          # 354 passed
 ```
+
+No prebuilt index is needed: the suite passes both on a fresh clone and
+against a built corpus, so a reviewer can run it before running anything
+else. The eval suite is separate and reported under
+[Measured results](#measured-results) above — it is a scored benchmark to
+run deliberately, not a gate on every commit.
 ## How it works
 
 Ten points, in the order a question travels through the system.

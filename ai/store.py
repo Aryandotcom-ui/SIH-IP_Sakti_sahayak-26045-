@@ -1708,8 +1708,8 @@ class VectorStore:
             candidate["authority_weight"] = authority_weight
             candidate["jurisdiction_weight"] = jurisdiction_weight
 
-            # Retained unmodified so the diagnostic surfaces
-            # (debug_retrieval.py, the evidence page) can still show what
+            # Retained unmodified so the diagnostic surfaces (the
+            # evidence page, the retrieval eval) can still show what
             # relevance alone said, separately from what authority did
             # to it.
             candidate["relevance_score"] = candidate["fused_score"]

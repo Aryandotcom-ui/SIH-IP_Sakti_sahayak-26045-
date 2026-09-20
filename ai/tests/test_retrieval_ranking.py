@@ -14,7 +14,9 @@ the ones asserting what this step cannot do.
 
 These exercise the arithmetic directly rather than through Chroma, so
 they run without an ingested corpus. The end-to-end behaviour against
-the real 2,274-chunk index is covered by debug_retrieval.py.
+the real index is covered by the retrieval eval:
+
+    python -m ai.person_c_generation.eval.eval_runner --retrieval
 """
 
 from __future__ import annotations
@@ -157,7 +159,7 @@ def test_unknown_instrument_type_is_not_penalised():
 
 def test_relevance_score_is_preserved_for_diagnostics():
     """Re-ranking must not destroy what relevance alone said — the
-    evidence page and debug_retrieval.py show both."""
+    evidence page shows both."""
     ranked = rerank([candidate("c", 0.60, "guideline")])
     assert ranked[0]["relevance_score"] == 0.60
     assert ranked[0]["fused_score"] < 0.60
