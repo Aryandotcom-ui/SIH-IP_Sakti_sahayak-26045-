@@ -397,4 +397,75 @@ export function JurisdictionTag({ jurisdiction }) {
   );
 }
 
+/**
+ * A GREEN / AMBER / RED screening result.
+ *
+ * The reason line is not decoration. GREEN here means both that no
+ * obligation fired and that the screening had enough facts to mean it —
+ * "nothing triggered" and "nothing triggered because nobody answered the
+ * question that decides it" are different findings, and only the first is
+ * green. See _screening_status in backend/app/api/insight_routes.py.
+ */
+export function StatusBand({ status, reason }) {
+  const tone = {
+    GREEN: { cls: 'ok', label: 'No obligations triggered' },
+    AMBER: { cls: 'warn', label: 'Obligations or open questions' },
+    RED: { cls: 'stop', label: 'Blocking obligations' },
+    UNKNOWN: { cls: 'neutral', label: 'Could not be screened' },
+  }[status] ?? { cls: 'neutral', label: 'Could not be screened' };
 
+  return (
+    <div className={`band band-${tone.cls}`} role="status">
+      <span className="band-dot" aria-hidden="true" />
+      <div style={{ minWidth: 0 }}>
+        <strong className="band-title">{tone.label}</strong>
+        <p className="band-reason">{reason}</p>
+      </div>
+      <span className="band-tag">{status}</span>
+    </div>
+  );
+}
+
+/** A labelled figure. Shows a dash, never a zero, for a number that has not
+ *  arrived — on a page whose whole claim is that its numbers are real, an
+ *  invented placeholder is the wrong thing to fake. */
+export function Stat({ value, label, hint }) {
+  return (
+    <div className="stat">
+      <div className="stat-n">{value ?? '—'}</div>
+      <div className="stat-l">{label}{hint && <Explain>{hint}</Explain>}</div>
+    </div>
+  );
+}
+
+/** A verified/unverified marker for a single citation. */
+export function VerifyMark({ verified }) {
+  return verified
+    ? <span className="vmark vmark-ok"><Check size={12} /> supported by a retrieved passage</span>
+    : <span className="vmark vmark-no"><Alert size={12} /> not found in the retrieved passages</span>;
+}
+
+/**
+ * The index is missing.
+ *
+ * An unbuilt corpus abstains on every question at 0% confidence, which looks
+ * exactly like a working product that cannot answer anything — the same
+ * reply to every input, with no hint that the cause is a missing build step
+ * rather than the question. This says which, before the user has typed
+ * anything, because the alternative is watching them conclude the whole
+ * system is broken.
+ */
+export function CorpusMissing() {
+  return (
+    <div className="notice notice-stop" role="alert" style={{ marginBottom: 20 }}>
+      <Alert size={18} style={{ flexShrink: 0 }} />
+      <span>
+        <strong>The search index has not been built.</strong> There are no passages to
+        search, so every question will abstain at 0% confidence regardless of what you
+        ask — this is a missing build step, not a limit of the corpus. Build it with{' '}
+        <code>./scripts/run.sh</code>, or directly:{' '}
+        <code>python -m ai.cli data/pdfs --manifest ai/corpus.yaml --model tfidf</code>
+      </span>
+    </div>
+  );
+}
